@@ -1,0 +1,26 @@
+# 代码产物, 运行时自建
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 本地/系统杂物
+.DS_Store
+.git/
+.gitignore
+.vscode/
+.idea/
+.claude/
+
+# 运行时目录 — 容器内会重新创建, 研究证据和历史不入镜像
+runtime/
+
+# 文档 & 研究产物 (非必须进镜像, 但不大可以保留; 如需极简, 也可忽略)
+# README.md
+# CLAUDE.md
+# runtime/experiments/  (已包含在 runtime/)
+
+# Docker 本身
+Dockerfile
+docker-compose.yml
+.dockerignore

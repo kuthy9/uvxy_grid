@@ -1,0 +1,47 @@
+# ───────── Python ─────────
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ───────── 虚拟环境 ─────────
+.venv/
+venv/
+env/
+.python-version
+
+# ───────── 系统 / 编辑器 ─────────
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ───────── Claude Code 项目本地 (含本地 settings / hooks) ─────────
+.claude/
+
+# ───────── 密钥与本地配置 (绝对不能进 git) ─────────
+.env
+.env.*
+!.env.example
+tws_settings/
+
+# ───────── 运行时产物 (实盘 DB / 日志 / 周报 / 状态快照 / 缓存) ─────────
+runtime/
+data_cache/
+logs/
+
+# ───────── 实验产物的临时副本 (主线产物在 runtime/experiments/ 已被忽略) ─────────
+*.tmp
+*.bak
+
+# ───────── 历史数据保留, 但 parquet 缓存忽略 ─────────
+data/*.parquet

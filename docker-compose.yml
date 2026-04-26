@@ -1,0 +1,65 @@
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: ib-gateway
+    restart: always
+
+    environment:
+      TWS_USERID: ${TWS_USERID}
+      TWS_PASSWORD: ${TWS_PASSWORD}
+      TRADING_MODE: ${TRADING_MODE}            # paper | live
+      TWS_SETTINGS_PATH: ${TWS_SETTINGS_PATH}
+      TWS_ACCEPT_INCOMING: ${TWS_ACCEPT_INCOMING}
+      READ_ONLY_API: ${READ_ONLY_API}
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD}
+      TWOFA_TIMEOUT_ACTION: ${TWOFA_TIMEOUT_ACTION}
+      RELOGIN_AFTER_TWOFA_TIMEOUT: ${RELOGIN_AFTER_TWOFA_TIMEOUT}
+      EXISTING_SESSION_DETECTED_ACTION: ${EXISTING_SESSION_DETECTED_ACTION}
+      ALLOW_BLIND_TRADING: ${ALLOW_BLIND_TRADING}
+      TIME_ZONE: ${TIME_ZONE}
+      TZ: ${TIME_ZONE}
+      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME}
+
+    volumes:
+      - ./tws_settings:/home/ibgateway/tws_settings
+
+    ports:
+      - "10.0.0.178:5900:5900"       # VNC (仅 LAN IP 暴露, 根据部署环境调整)
+
+    # 登录完成后 socat 才会监听 4003/4004. uvxy-grid 必须等 healthy 再起.
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc '</dev/tcp/127.0.0.1/4004' || bash -lc '</dev/tcp/127.0.0.1/4003'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20                    # ~5 分钟 (登录 + 2FA 最多要这么久)
+      start_period: 60s
+
+  uvxy-grid:
+    build:
+      context: /volume2/docker/uvxy_grid
+    container_name: uvxy-grid
+    restart: always
+
+    # 关键: 等 ib-gateway healthy (登录完成 + 4004 listening) 再启动,
+    # 否则 main.py 会因为读不到 NetLiquidation 而 sys.exit(3).
+    depends_on:
+      ib-gateway:
+        condition: service_healthy
+
+    working_dir: /app
+    command: ["python", "-u", "main.py"]
+
+    environment:
+      TZ: America/New_York
+      IBKR_HOST: ib-gateway
+      IBKR_PORT: "4004"              # gnzsnz/ib-gateway socat paper; live 改 4003
+      IBKR_CLIENT_ID: "1"
+      CAPITAL_RESERVE_RATIO: "0.05"  # TOTAL_CAPITAL = NetLiquidation × (1 - 0.05)
+      LOG_FILE: ./runtime/grid_trader.log
+      DB_FILE: ./runtime/trades.db
+      REPORT_DIR: ./runtime/reports
+      DATA_CACHE_DIR: ./runtime/data_cache
+      LOG_LEVEL: INFO
+
+    volumes:
+      - /volume2/docker/uvxy_grid:/app

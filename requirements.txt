@@ -1,0 +1,14 @@
+# Python >= 3.10 required
+#   - zoneinfo (3.9+)
+#   - PEP 585 generics: list[dict] (3.9+)
+#   - PEP 604 unions: X | Y (3.10+)
+#
+# 运行时 (main.py / backtest.py / scripts/):
+ib_insync>=0.9.86      # IBKR 实盘执行 (IBKRExecutor)
+yfinance>=0.2.30       # DataProvider 历史数据下载
+pandas>=2.0.0          # 数据处理
+pyarrow>=14.0.0        # pandas parquet 后端 (data_cache)
+numpy>=1.24.0          # 指标计算
+
+# 仅 data/qqq.py (Alpaca 数据抓取脚本) 需要; 回测读 CSV 不依赖此包:
+requests>=2.31.0
