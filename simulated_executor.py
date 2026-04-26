@@ -197,7 +197,9 @@ class SimulatedExecutor(Executor):
             if self.cash + 1e-9 < total_cost:
                 return None
             self.cash -= total_cost
-            self.position_cost += qty * fill_price
+            # cost_basis 把买入佣金算进去, 这样 realized_pnl 与 PnLTracker.net_pnl
+            # 在卖出时口径一致 (= 卖出净所得 - 买入总成本含佣 - 卖出佣金).
+            self.position_cost += total_cost
             self.position_shares += qty
         else:
             avg_cost = (self.position_cost / self.position_shares

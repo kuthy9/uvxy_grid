@@ -1,18 +1,12 @@
 import os
-import sys
 
 import requests
 import pandas as pd
 
 url = "https://data.alpaca.markets/v2/stocks/bars"
 
-api_key = os.getenv("APCA_API_KEY_ID")
-api_secret = os.getenv("APCA_API_SECRET_KEY")
-if not api_key or not api_secret:
-    sys.exit(
-        "缺少 Alpaca 凭据: 请设置环境变量 APCA_API_KEY_ID / APCA_API_SECRET_KEY 后重试. "
-        "可在 https://alpaca.markets 控制台获取."
-    )
+api_key = "PKQGZMEOZCJCMUWKH73FYVN4V3"
+api_secret = "CQPYmKq49PaNpgLnrN5weWb3pPLMN35SEp7UpzGC43LR"
 
 headers = {
     "APCA-API-KEY-ID": api_key,
@@ -21,9 +15,9 @@ headers = {
 
 params = {
     "symbols": "UVXY",
-    "timeframe": "15Min",
+    "timeframe": "4Hour",
     "start": "2021-01-01",
-    "end": "2026-01-01",
+    "end": "2026-04-24",
     "feed": "iex",
     "limit": 10000
 }
@@ -46,7 +40,7 @@ while True:
         break
 
 df = pd.DataFrame(all_bars)
-out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uvxy_15min.csv")
+out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uvxy_4h.csv")
 df.to_csv(out_path, index=False)
 
 print(df.head())

@@ -44,9 +44,9 @@ def main():
     clock = LiveClock()
     executor = IBKRExecutor()
     db = TradeDatabase()
-    pnl = PnLTracker()  # 实盘: clock=None, 用 datetime.now()
+    pnl = PnLTracker(clock=clock)
     risk = RiskManager(db, clock=clock)
-    state = StateMachine()
+    state = StateMachine(clock=clock)
     entry = EntryFilter()
     data_provider = DataProvider()
 

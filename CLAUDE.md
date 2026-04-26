@@ -236,3 +236,8 @@ docker compose up -d
 - 回测 / 实盘共用 `GridBot`，禁止复制一份"回测专用业务逻辑"。
 - 不在没有证据的情况下宣称"这个参数更优"。
 - 不用 `--no-verify` / `--no-gpg-sign` / `git reset --hard` 这类捷径来绕过问题。
+
+---
+
+## 10. 特殊注意事项
+- 可以保留 /data 目录下qqq.py文件中的ID和secret，无需改动

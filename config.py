@@ -227,7 +227,9 @@ TRADING_HOURS_PER_DAY = 6.5           # 9:30-16:00 ET
 #  风控 (V47: 放宽硬止损, 容忍 UVXY 高波动)
 # ════════════════════════════════════════════
 HARD_STOP_LOSS_PCT = 0.20              # QQQ-tuned: 0.15
-MAX_DAILY_LOSS = 100.0
+# 单日已实现亏损上限 (按 TOTAL_CAPITAL 比例). 5% 与 V49 baseline ($2000 → $100) 数值一致,
+# 但跨资金规模都保持同一语义, 不再随 NetLiquidation 变化漂移.
+MAX_DAILY_LOSS_PCT = 0.05
 MAX_POSITION_VALUE_PCT = 0.95
 
 # ════════════════════════════════════════════

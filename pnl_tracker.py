@@ -79,18 +79,19 @@ class PnLTracker:
     def __init__(self, db_path: str = None, clock=None):
         self.db_path = db_path or config.DB_FILE
         self.buy_queue: deque[BuyLot] = deque()
-        self._clock = clock  # 可选, 回测时提供 HistoricalClock
+        # clock 始终注入 — 业务模块严禁直接读 wall-clock.
+        # 实盘 / 测试不传时默认 LiveClock (= 系统时间, 语义与原 fallback 等价但接口统一).
+        if clock is None:
+            from interfaces import LiveClock
+            clock = LiveClock()
+        self._clock = clock
         self._init_db()
 
     def _now_iso(self) -> str:
-        if self._clock is not None:
-            return self._clock.now().isoformat()
-        return datetime.now().isoformat()
+        return self._clock.now().isoformat()
 
     def _today_str(self) -> str:
-        if self._clock is not None:
-            return self._clock.now().strftime("%Y-%m-%d")
-        return datetime.now().strftime("%Y-%m-%d")
+        return self._clock.now().strftime("%Y-%m-%d")
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:

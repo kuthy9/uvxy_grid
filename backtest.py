@@ -50,17 +50,20 @@ class TradeEvent:
 @dataclass
 class BacktestStats:
     initial_capital: float = 0.0
-    final_equity: float = 0.0
+    final_equity: float = 0.0          # cash + 未平仓 market_value (含浮盈)
     total_return_pct: float = 0.0
     annualized_return_pct: float = 0.0
     buy_hold_return_pct: float = 0.0
     alpha_pct: float = 0.0
-    total_events: int = 0
+    total_events: int = 0              # state + trade + risk + recenter
+    total_trades: int = 0              # 实际成交次数 (BUY+SELL fills)
+    total_buys: int = 0
+    total_sells: int = 0
     total_grid_sessions: int = 0
     total_recenters: int = 0
     total_exits: int = 0
     grid_round_trips: int = 0
-    win_rate_pct: float = 0.0
+    win_rate_pct: float = 0.0          # 仅含网格 FIFO 配对; 底仓 EXIT 不计入
     avg_pnl_per_close: float = 0.0
     total_realized_pnl: float = 0.0
     total_commission: float = 0.0
@@ -243,7 +246,7 @@ class BacktestRunner:
         self.db = TradeEventCollector(self.db_path, self.clock)
         self.pnl = PnLTracker(self.db_path, clock=self.clock)
         self.risk = RiskManager(self.db, clock=self.clock)
-        self.state_machine = StateMachine()
+        self.state_machine = StateMachine(clock=self.clock)
         self.entry_filter = EntryFilter()
         self.data_fetcher = HistoricalDataFetcher(self.df, self.clock)
 
@@ -284,10 +287,13 @@ class BacktestRunner:
         return dt
 
     def _roll_daily_state(self, ts: datetime, close: float):
-        """每天开始时重置日内风控, 并用昨日收盘初始化闪崩保护"""
+        """每天开始时重置日内风控, 并用昨日收盘初始化闪崩保护.
+
+        bot.start() 已经用第一根 bar 的 close 走了 risk.initialize_from_db,
+        所以首次进入这里只做 bookkeeping, 不再重复初始化 (避免重复 WARN).
+        """
         current_date = ts.date()
         if self._last_day is None:
-            self.risk.initialize_from_db(current_price=close)
             self._last_day = current_date
             self._prev_close_price = close
             return
@@ -364,6 +370,12 @@ class BacktestRunner:
         )
         stats.alpha_pct = stats.total_return_pct - stats.buy_hold_return_pct
         stats.total_events = len(self.db.event_stream)
+        trade_events = [e for e in self.db.event_stream if e.kind == "trade"]
+        stats.total_trades = len(trade_events)
+        stats.total_buys = sum(1 for e in trade_events
+                                if e.action.startswith("BUY"))
+        stats.total_sells = sum(1 for e in trade_events
+                                 if e.action.startswith("SELL"))
         stats.total_grid_sessions = self.state_machine.context.total_grid_sessions
         stats.total_recenters = self.state_machine.context.total_recenters
         stats.total_exits = self.state_machine.context.total_exits
@@ -536,20 +548,24 @@ def print_stats(stats: BacktestStats, events: list[TradeEvent], show_events: int
     print("  回测结果 (main.py 同一套逻辑)")
     print(f"{'=' * 68}")
     print("\n  📈 收益")
-    print(f"     起始资金:     ${stats.initial_capital:,.2f}")
-    print(f"     最终权益:     ${stats.final_equity:,.2f}")
-    print(f"     总收益率:     {stats.total_return_pct:+.2f}%")
-    print(f"     年化收益率:   {stats.annualized_return_pct:+.2f}%")
-    print(f"     Buy & Hold:   {stats.buy_hold_return_pct:+.2f}%")
-    print(f"     Alpha:        {stats.alpha_pct:+.2f}%")
+    print(f"     起始资金:        ${stats.initial_capital:,.2f}")
+    print(f"     最终权益(含浮盈):${stats.final_equity:,.2f}")
+    print(f"     总收益率:        {stats.total_return_pct:+.2f}%")
+    print(f"     年化收益率:      {stats.annualized_return_pct:+.2f}%")
+    print(f"     Buy & Hold:      {stats.buy_hold_return_pct:+.2f}%")
+    print(f"     Alpha:           {stats.alpha_pct:+.2f}%")
 
     print("\n  📊 交易")
-    print(f"     事件数:       {stats.total_events}")
-    print(f"     网格平仓数:   {stats.grid_round_trips}")
-    print(f"     胜率:         {stats.win_rate_pct:.1f}%")
-    print(f"     平均每次:     ${stats.avg_pnl_per_close:+.2f}")
-    print(f"     已实现盈亏:   ${stats.total_realized_pnl:+.2f}")
-    print(f"     总手续费:     ${stats.total_commission:.2f}")
+    print(f"     事件数(全):      {stats.total_events}")
+    print(f"     交易次数:        {stats.total_trades}  "
+          f"(买 {stats.total_buys} / 卖 {stats.total_sells})")
+    print(f"     网格平仓数:      {stats.grid_round_trips}")
+    print(f"     网格平仓胜率:    {stats.win_rate_pct:.1f}%  "
+          f"(仅含网格 FIFO 配对, 不含底仓 EXIT)")
+    print(f"     平均每次:        ${stats.avg_pnl_per_close:+.2f}")
+    print(f"     已实现盈亏:      ${stats.total_realized_pnl:+.2f}  "
+          f"(账户级, 已扣买入+卖出佣金)")
+    print(f"     总手续费:        ${stats.total_commission:.2f}")
 
     print("\n  ⚠️ 风险")
     print(f"     最大回撤:     {stats.max_drawdown_pct:.2f}%")

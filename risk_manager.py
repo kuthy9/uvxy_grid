@@ -230,10 +230,15 @@ class RiskManager:
         if self._daily_loss_triggered:
             return RiskCheckResult(False, "单日亏损上限")
         today_pnl = self.db.get_today_realized_pnl()
-        if today_pnl < -config.MAX_DAILY_LOSS:
+        limit = config.require_total_capital() * config.MAX_DAILY_LOSS_PCT
+        if today_pnl < -limit:
             self._daily_loss_triggered = True
-            self.db.log_risk_event("DAILY_LIMIT",
-                                    f"日亏损 ${today_pnl:.2f}", "暂停交易")
+            self.db.log_risk_event(
+                "DAILY_LIMIT",
+                f"日亏损 ${today_pnl:.2f} > 上限 ${limit:.2f} "
+                f"({config.MAX_DAILY_LOSS_PCT*100:.1f}%)",
+                "暂停交易"
+            )
             return RiskCheckResult(False, f"日亏损 ${today_pnl:.2f}")
         return RiskCheckResult(True)
 

@@ -67,10 +67,16 @@ class StateMachine:
         sm.commit_transition(action)        # 确认动作执行后转换状态
     """
 
-    def __init__(self):
+    def __init__(self, clock=None):
+        # clock 注入 — 与 PnLTracker / RiskManager 一致: 测试 / 回测传 HistoricalClock,
+        # 实盘默认 LiveClock. 业务模块禁止直接读 wall-clock.
+        if clock is None:
+            from interfaces import LiveClock
+            clock = LiveClock()
+        self._clock = clock
         self.context = StateContext(
             current_state=SystemState.SCANNING,
-            state_entered_at=datetime.now().isoformat(),
+            state_entered_at=self._clock.now().isoformat(),
         )
 
     @property
@@ -80,7 +86,7 @@ class StateMachine:
     def transition_to(self, new_state: SystemState, reason: str = "",
                       now: Optional[datetime] = None):
         """状态转换"""
-        now = now or datetime.now()
+        now = now or self._clock.now()
         old = self.context.current_state
         self.context.current_state = new_state
         self.context.state_entered_at = now.isoformat()
@@ -113,7 +119,7 @@ class StateMachine:
     def on_entry_evaluation(self, allow_entry: bool, reason: str = "",
                             now: Optional[datetime] = None):
         """处理入场筛选器的评估结果"""
-        now = now or datetime.now()
+        now = now or self._clock.now()
         self.context.last_evaluation_time = now.isoformat()
 
         if self.state == SystemState.SCANNING:
@@ -139,7 +145,7 @@ class StateMachine:
             return False
         if not self.context.entry_window_started_at:
             return False
-        current_time = current_time or datetime.now()
+        current_time = current_time or self._clock.now()
         started = datetime.fromisoformat(self.context.entry_window_started_at)
         strategy_hours = config.strategy_interval_hours()
         elapsed_bars = (current_time - started).total_seconds() / (strategy_hours * 3600)
@@ -172,7 +178,7 @@ class StateMachine:
 
     def on_recenter(self, now: Optional[datetime] = None):
         """记录中轴重置"""
-        now = now or datetime.now()
+        now = now or self._clock.now()
         self.context.last_recenter_at = now.isoformat()
         self.context.total_recenters += 1
 
@@ -230,7 +236,7 @@ class StateMachine:
                  ctx.grid_active_since, ctx.last_recenter_at,
                  ctx.exit_initiated_at, ctx.exit_reason,
                  ctx.total_grid_sessions, ctx.total_recenters, ctx.total_exits,
-                 datetime.now().isoformat())
+                 self._clock.now().isoformat())
             )
 
     def load_state(self, db_path: str) -> bool:
@@ -275,7 +281,7 @@ class StateMachine:
         """状态摘要(用于日志和报告)"""
         ctx = self.context
         entered = datetime.fromisoformat(ctx.state_entered_at)
-        in_state_for = datetime.now() - entered
+        in_state_for = self._clock.now() - entered
         if config.STRATEGY_INTERVAL.endswith("d"):
             duration_text = f"{in_state_for.total_seconds() / 86400:.1f} 天"
         else:
