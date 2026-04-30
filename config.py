@@ -184,7 +184,7 @@ ENTRY_PRICE_BAND_ATR = 1.0
 #   - 周末缓冲: 周五 10:30 ET 入 WAITING_ENTRY → 周一 10:30 ≈ 65 wall hours, 周末窗口
 #     被 12 bars (48h) 含住; 实盘到周一开盘前 conditions 早已重新评估, 不会损失机会.
 # 实盘后续若观察到误踢, 可由 paper run 数据再加大.
-ENTRY_MAX_WAIT_BARS = 12
+ENTRY_MAX_WAIT_BARS = 1
 
 # WAITING_ENTRY 下 _execute_entry 返回 False 的连续次数阈值;
 # 触发后自动回 SCANNING, 防止取价/下单/成交异常把状态长期卡在 waiting_entry,
