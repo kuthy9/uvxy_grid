@@ -1106,5 +1106,246 @@ class TestIBKRExecutorDelayedDegrade(unittest.TestCase):
         self.assertIsNone(ex._market_data_type_effective)
 
 
+class TestIBKRExecutorReconnectRetry(unittest.TestCase):
+    """
+    实盘 get_current_price 在 Socket disconnect / reqMktData 异常 / 未连接 时,
+    必须先 reconnect 再 retry, 不能直接返回 None — 否则 _execute_entry 会因
+    取价失败而错过入场. 单次轮询失败 ≠ 整体失败.
+    """
+
+    def _make_executor(self):
+        from ibkr_executor import IBKRExecutor
+        ex = IBKRExecutor()
+        ex.ib = MagicMock()
+        ex.ib.isConnected.return_value = True
+        # 已是 delayed, 避开降级路径让测试聚焦 retry 行为
+        ex._market_data_type_effective = 3
+        return ex
+
+    def test_first_poll_fails_then_second_succeeds(self):
+        """第一次 poll 抛 Socket disconnect, 第二次成功 — 应返回成功价并调过 reconnect."""
+        ex = self._make_executor()
+        calls = {"n": 0}
+
+        def poll_stub(timeout_sec):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionError("Socket disconnect")
+            return 9.99
+        ex._poll_price_once = poll_stub
+
+        reconnect_calls = {"n": 0}
+        def reconnect_stub():
+            reconnect_calls["n"] += 1
+            ex._market_data_type_effective = 3   # 保持 mdt=3 避开降级分支
+            return True
+        ex.reconnect = reconnect_stub
+
+        original = config.PRICE_RETRY_COUNT
+        config.PRICE_RETRY_COUNT = 2
+        try:
+            px = ex.get_current_price()
+        finally:
+            config.PRICE_RETRY_COUNT = original
+
+        self.assertAlmostEqual(px, 9.99, places=4)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(reconnect_calls["n"], 1)
+
+    def test_all_polls_fail_returns_none(self):
+        """所有 attempt 全部抛 Socket disconnect — 应返回 None, reconnect 被调用过."""
+        ex = self._make_executor()
+        ex._poll_price_once = MagicMock(
+            side_effect=ConnectionError("Socket disconnect")
+        )
+        ex.reconnect = MagicMock(return_value=True)
+
+        original = config.PRICE_RETRY_COUNT
+        config.PRICE_RETRY_COUNT = 2
+        try:
+            px = ex.get_current_price()
+        finally:
+            config.PRICE_RETRY_COUNT = original
+
+        self.assertIsNone(px)
+        # 每次 attempt 失败都尝试 reconnect → 至少调用 1 次
+        self.assertGreaterEqual(ex.reconnect.call_count, 1)
+
+    def test_request_exception_triggers_reconnect(self):
+        """reqMktData 抛任意异常 → 必须尝试 reconnect (即便最终仍失败)."""
+        ex = self._make_executor()
+        ex._poll_price_once = MagicMock(side_effect=RuntimeError("API broken"))
+        ex.reconnect = MagicMock(return_value=False)
+
+        original = config.PRICE_RETRY_COUNT
+        config.PRICE_RETRY_COUNT = 2
+        try:
+            ex.get_current_price()
+        finally:
+            config.PRICE_RETRY_COUNT = original
+
+        ex.reconnect.assert_called()
+
+    def test_not_connected_triggers_reconnect_first(self):
+        """is_connected=False → reconnect 后再 poll, reconnect 成功则后续轮询成功."""
+        ex = self._make_executor()
+        ex.ib.isConnected.return_value = False
+        ex._poll_price_once = MagicMock(return_value=15.0)
+
+        def reconnect_stub():
+            ex.ib.isConnected.return_value = True
+            ex._market_data_type_effective = 3
+            return True
+        ex.reconnect = MagicMock(side_effect=reconnect_stub)
+
+        original = config.PRICE_RETRY_COUNT
+        config.PRICE_RETRY_COUNT = 2
+        try:
+            px = ex.get_current_price()
+        finally:
+            config.PRICE_RETRY_COUNT = original
+
+        self.assertEqual(px, 15.0)
+        self.assertGreaterEqual(ex.reconnect.call_count, 1)
+
+
+class TestExecuteEntryPriceUnavailable(unittest.TestCase):
+    """get_current_price 返回 None 时, _execute_entry 必须 safe-fail —
+    不下单, 不伪造成交, 写 EXECUTE_ENTRY_PRICE_UNAVAILABLE 风险事件."""
+
+    def test_no_price_skips_order_and_logs_event(self):
+        from grid_bot import GridBot
+        bot = GridBot.__new__(GridBot)
+        bot.executor = MagicMock()
+        bot.executor.get_current_price.return_value = None
+        bot.executor.is_connected.return_value = True
+        bot.db = MagicMock()
+        bot._base_position_shares = 0.0
+
+        result = bot._execute_entry(MagicMock())
+
+        self.assertFalse(result)
+        bot.executor.place_market_order.assert_not_called()
+        bot.db.log_risk_event.assert_called()
+        first_arg = bot.db.log_risk_event.call_args[0][0]
+        self.assertEqual(first_arg, "EXECUTE_ENTRY_PRICE_UNAVAILABLE")
+
+
+class TestWaitingEntryAutoReset(unittest.TestCase):
+    """
+    waiting_entry 自动恢复: _execute_entry 返回 False 时累计计数,
+    达到 ENTRY_EXECUTION_MAX_FAILURES 则自动回 SCANNING, 不需要人工改 SQLite.
+    """
+
+    def _make_bot(self):
+        """构造一个最小可用的 GridBot, 状态置于 WAITING_ENTRY."""
+        from grid_bot import GridBot
+
+        clock = MagicMock()
+        clock.now.return_value = datetime(2026, 4, 28, 11, 0)
+
+        sm = StateMachine(clock=clock)
+        sm.transition_to(SystemState.WAITING_ENTRY,
+                         "测试 fixture", now=clock.now())
+
+        bot = GridBot.__new__(GridBot)
+        bot.clock = clock
+        bot.state_machine = sm
+        bot.db = MagicMock()
+        bot.db.db_path = ":memory:"
+        bot.risk = MagicMock()
+        bot.risk.check_trading_hours.return_value = True
+        bot.data_fetcher = MagicMock()
+        bot.data_fetcher.get_strategy_data.return_value = MagicMock()
+        bot.entry_filter = MagicMock()
+
+        eval_mock = MagicMock()
+        eval_mock.conditions_passed = True
+        eval_mock.rejection_reasons = []
+        eval_mock.timing_passed = True
+        bot.entry_filter.evaluate.return_value = eval_mock
+
+        bot.executor = MagicMock()
+        bot.grid = None
+        bot._base_position_shares = 0.0
+        bot._entry_execution_failures = 0
+        bot.strategy_df_days = 30
+        bot._persist_all = lambda: None  # 避免 fs 写入
+        return bot
+
+    def test_threshold_1_first_failure_returns_to_scanning(self):
+        """ENTRY_EXECUTION_MAX_FAILURES=1: 一次失败立即回 SCANNING."""
+        bot = self._make_bot()
+        bot._execute_entry = MagicMock(return_value=False)
+        original = config.ENTRY_EXECUTION_MAX_FAILURES
+        config.ENTRY_EXECUTION_MAX_FAILURES = 1
+        try:
+            bot._handle_waiting_entry()
+        finally:
+            config.ENTRY_EXECUTION_MAX_FAILURES = original
+
+        self.assertEqual(bot.state_machine.state, SystemState.SCANNING)
+        self.assertEqual(bot._entry_execution_failures, 0)
+        # 写了一条 WAITING_ENTRY_AUTO_RESET 风险事件
+        called_types = [c[0][0] for c in bot.db.log_risk_event.call_args_list]
+        self.assertIn("WAITING_ENTRY_AUTO_RESET", called_types)
+
+    def test_threshold_2_first_stays_then_second_resets(self):
+        """ENTRY_EXECUTION_MAX_FAILURES=2: 第一次仍 WAITING, 第二次回 SCANNING."""
+        bot = self._make_bot()
+        bot._execute_entry = MagicMock(return_value=False)
+        original = config.ENTRY_EXECUTION_MAX_FAILURES
+        config.ENTRY_EXECUTION_MAX_FAILURES = 2
+        try:
+            bot._handle_waiting_entry()
+            self.assertEqual(bot.state_machine.state, SystemState.WAITING_ENTRY)
+            self.assertEqual(bot._entry_execution_failures, 1)
+
+            bot._handle_waiting_entry()
+        finally:
+            config.ENTRY_EXECUTION_MAX_FAILURES = original
+
+        self.assertEqual(bot.state_machine.state, SystemState.SCANNING)
+        self.assertEqual(bot._entry_execution_failures, 0)
+
+    def test_success_resets_failure_counter(self):
+        """成功执行入场后, 即使之前累计了失败次数也应清零."""
+        bot = self._make_bot()
+        bot._entry_execution_failures = 3
+        bot._execute_entry = MagicMock(return_value=True)
+        original = config.ENTRY_EXECUTION_MAX_FAILURES
+        config.ENTRY_EXECUTION_MAX_FAILURES = 5
+        try:
+            bot._handle_waiting_entry()
+        finally:
+            config.ENTRY_EXECUTION_MAX_FAILURES = original
+
+        self.assertEqual(bot._entry_execution_failures, 0)
+
+    def test_check_entry_timeout_still_triggers_scanning(self):
+        """新计数器逻辑不能压制原有 ENTRY_MAX_WAIT_BARS 超时返扫描的链路."""
+        bot = self._make_bot()
+
+        # 把窗口起点拨回去, 让 check_entry_timeout 触发
+        started = bot.state_machine.context.entry_window_started_at
+        self.assertIsNotNone(started)
+        far_future = (
+            datetime.fromisoformat(started)
+            + timedelta(hours=(config.ENTRY_MAX_WAIT_BARS + 1)
+                              * config.strategy_interval_hours())
+        )
+        bot.clock.now.return_value = far_future
+
+        # _execute_entry 不应被调用 — check_entry_timeout 在它之前就 return 了
+        bot._execute_entry = MagicMock(return_value=False)
+
+        bot._handle_waiting_entry()
+
+        self.assertEqual(bot.state_machine.state, SystemState.SCANNING)
+        bot._execute_entry.assert_not_called()
+        # 失败计数器没有动 (这条路径不属于执行失败)
+        self.assertEqual(bot._entry_execution_failures, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

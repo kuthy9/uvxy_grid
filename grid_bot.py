@@ -92,6 +92,9 @@ class GridBot:
         self._last_recenter_check: Optional[datetime] = None
         self._last_weekly_report_week: Optional[tuple] = None  # (iso_year, iso_week)
         self._base_position_shares = 0.0
+        # 连续 _execute_entry 失败计数; 达到 config.ENTRY_EXECUTION_MAX_FAILURES
+        # 时自动回 SCANNING, 避免 waiting_entry 长期卡死.
+        self._entry_execution_failures = 0
 
     # ───────────────────────────────
     #  生命周期
@@ -483,13 +486,62 @@ class GridBot:
         if not evaluation.timing_passed:
             return
 
-        self._execute_entry(evaluation)
+        success = self._execute_entry(evaluation)
+        if success:
+            self._entry_execution_failures = 0
+            return
+
+        # 失败路径: 累加计数; 达到阈值就回 SCANNING, 不在 waiting_entry 长期卡死.
+        self._entry_execution_failures += 1
+        threshold = max(1, int(getattr(config, "ENTRY_EXECUTION_MAX_FAILURES", 1)))
+        logger.warning(
+            f"_execute_entry 失败 {self._entry_execution_failures}/{threshold} "
+            f"(state={self.state_machine.state.value})"
+        )
+        if self._entry_execution_failures >= threshold:
+            old = self.state_machine.state.value
+            reason = (
+                f"入场执行连续失败 {self._entry_execution_failures} 次, "
+                f"自动回到扫描"
+            )
+            self.state_machine.transition_to(
+                SystemState.SCANNING, reason, now=now
+            )
+            self.db.log_state_transition(
+                old, self.state_machine.state.value, reason
+            )
+            log_risk_event = getattr(self.db, "log_risk_event", None)
+            if callable(log_risk_event):
+                try:
+                    log_risk_event(
+                        "WAITING_ENTRY_AUTO_RESET",
+                        f"连续 {self._entry_execution_failures} 次入场执行失败",
+                        "自动回 SCANNING, 等待下一轮筛选"
+                    )
+                except Exception as e:
+                    logger.warning(f"log_risk_event 失败 (非致命): {e}")
+            self._entry_execution_failures = 0
+            self._persist_all()
 
     def _execute_entry(self, evaluation):
         """市价单建底仓, 偏差>1.5% 回滚"""
         current_price = self.executor.get_current_price()
         if not current_price:
-            logger.error("无法获取价格")
+            connected = bool(getattr(self.executor, "is_connected", lambda: True)())
+            reason = "executor_disconnected" if not connected else "no_quote_after_retry"
+            logger.error(
+                f"_execute_entry: 取价失败 reason={reason} — 跳过本次入场, 不下单"
+            )
+            log_risk_event = getattr(self.db, "log_risk_event", None)
+            if callable(log_risk_event):
+                try:
+                    log_risk_event(
+                        "EXECUTE_ENTRY_PRICE_UNAVAILABLE",
+                        f"reason={reason} 入场条件已满足但取价失败",
+                        "跳过入场, 等待下个 bar 重试"
+                    )
+                except Exception as e:
+                    logger.warning(f"log_risk_event 失败 (非致命): {e}")
             return False
 
         base_capital = config.TOTAL_CAPITAL * config.BASE_POSITION_RATIO

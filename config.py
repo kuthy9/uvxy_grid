@@ -49,6 +49,12 @@ MARKET_DATA_TYPE = int(os.getenv("MARKET_DATA_TYPE", "1"))
 # 启动阶段 reqMktData 等待窗口 (秒). 原 3s 过短, 冷启动常返 None → 闪崩保护失效.
 STARTUP_PRICE_TIMEOUT_SEC = float(os.getenv("STARTUP_PRICE_TIMEOUT_SEC", "15"))
 
+# 实盘 get_current_price 单次轮询超时 (秒) 与重试次数.
+# 单次轮询用 PRICE_TIMEOUT_SEC; 出现 Socket disconnect / 异常 / 超时无报价时,
+# IBKRExecutor 会在外层 reconnect 后再 retry, 最多 PRICE_RETRY_COUNT 次.
+PRICE_TIMEOUT_SEC = float(os.getenv("PRICE_TIMEOUT_SEC", "15"))
+PRICE_RETRY_COUNT = int(os.getenv("PRICE_RETRY_COUNT", "2"))
+
 # reqHistoricalData 取前收盘时的回溯窗口 (自然日). 5D 足以覆盖周末 + 一个节假日.
 IBKR_HIST_PREV_CLOSE_DAYS = int(os.getenv("IBKR_HIST_PREV_CLOSE_DAYS", "5"))
 
@@ -164,7 +170,26 @@ ENTRY_MIN_DAILY_VOLUME_USD = 1.0e6     # 日均成交额下限 (USD)
 ENTRY_BLACKOUT_DAYS_BEFORE_EARNINGS = 7
 ENTRY_BLACKOUT_DAYS_AFTER_EARNINGS = 1
 ENTRY_PRICE_BAND_ATR = 1.0
-ENTRY_MAX_WAIT_BARS = 24
+# WAITING_ENTRY 等价格回到 EMA±1×ATR 入场带的最大 bar 数. 4h 周期下 12 bars=48h.
+# 与 24 bars (96h, 4 自然日) 相比的依据 (无 full backtest, 系统语义推导):
+#   - timing_passed 三个条件 (价格在 band 内 / 当前 K 线非异常 / 最近 3 根 K 线非单边)
+#     在 conditions_passed 已经命中 (ADX≤20, ATR%∈[2%,4.5%], 价格<1×ATR 偏离 EMA) 的
+#     mean-reverting 区间, UVXY 4h 通常 1-3 bar 内回到入场带; 12 bars 给 4-12× 余量.
+#   - WAITING_ENTRY 同时受 on_entry_evaluation 监管: 每个 bar 重评 conditions_passed,
+#     一旦 ADX / ATR% / BB 飘走立即回 SCANNING — 这条链路是主退出, ENTRY_MAX_WAIT_BARS
+#     是兜底, 不需要拉到 4 天.
+#   - 与新加 ENTRY_EXECUTION_MAX_FAILURES (8h) 形成分层语义:
+#       execution-failure 路径 ~8h 内回扫描
+#       timing-not-passed 路径 ~48h 回扫描
+#   - 周末缓冲: 周五 10:30 ET 入 WAITING_ENTRY → 周一 10:30 ≈ 65 wall hours, 周末窗口
+#     被 12 bars (48h) 含住; 实盘到周一开盘前 conditions 早已重新评估, 不会损失机会.
+# 实盘后续若观察到误踢, 可由 paper run 数据再加大.
+ENTRY_MAX_WAIT_BARS = 12
+
+# WAITING_ENTRY 下 _execute_entry 返回 False 的连续次数阈值;
+# 触发后自动回 SCANNING, 防止取价/下单/成交异常把状态长期卡在 waiting_entry,
+# 不需要人工改 SQLite. 默认 2: 容忍单次瞬时抖动 (如 IBKR 心跳掉线), 连续两次才退场.
+ENTRY_EXECUTION_MAX_FAILURES = int(os.getenv("ENTRY_EXECUTION_MAX_FAILURES", "2"))
 
 # ════════════════════════════════════════════
 #  网格 (V47: 跟得上 UVXY 高频换向)

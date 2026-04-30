@@ -86,63 +86,111 @@ class IBKRExecutor(Executor):
 
     def get_current_price(self) -> Optional[float]:
         """
-        取当前价 — 多级降级: last → midpoint(bid+ask)/2 → close → marketPrice().
+        取当前价 — 多级降级 + reconnect/retry 保护.
 
-        超时策略 (v2.4):
-          - 窗口长度由 config.STARTUP_PRICE_TIMEOUT_SEC 控制 (默认 15s)
-          - live (type=1) 首次超时后, 自动降级 delayed (type=3) 重试一次
-          - 降级触发后会 (a) 显式 WARN 日志, (b) 缓存在 self._market_data_type_effective,
-            后续调用直接用 delayed, 不再重试 live
-          - 重连 (reconnect) 会清掉缓存, 重新按 config.MARKET_DATA_TYPE 起步
+        Quote fallback 顺序: last → midpoint(bid+ask)/2 → close → marketPrice().
+
+        超时 / 重连策略:
+          - 单次轮询窗口由 config.PRICE_TIMEOUT_SEC 控制 (默认 15s).
+          - 整体最多 config.PRICE_RETRY_COUNT 次 attempt (默认 2).
+          - attempt 内: 未连接 → reconnect; reqMktData 异常 / Socket disconnect →
+            reconnect 后下一次 attempt 重试.
+          - live (type=1) 首次 attempt 内超时, 自动降级 delayed (type=3) 重试一次,
+            缓存到 self._market_data_type_effective; reconnect 会清缓存.
+          - 失败原因日志区分: not_connected / reconnect_failed /
+            request_exception / timeout_no_quote.
         """
-        if not self.is_connected():
-            return None
-        price = self._poll_price_once(config.STARTUP_PRICE_TIMEOUT_SEC)
-        if price is not None:
-            return price
-        # 仅当前处于 live (1) 才考虑降级到 delayed (3)
-        if self._market_data_type_effective == 1:
-            logger.warning(
-                f"⚠️ {config.SYMBOL} live 行情 {config.STARTUP_PRICE_TIMEOUT_SEC:.0f}s 无推送, "
-                f"降级为 delayed(15min). 后续本进程都用 delayed, 重连会重新评估."
-            )
-            self._apply_market_data_type(3, reason="live 超时自动降级")
-            price = self._poll_price_once(config.STARTUP_PRICE_TIMEOUT_SEC)
+        timeout = float(getattr(config, "PRICE_TIMEOUT_SEC", 15.0))
+        max_retries = max(1, int(getattr(config, "PRICE_RETRY_COUNT", 2)))
+
+        for attempt in range(1, max_retries + 1):
+            if not self.is_connected():
+                logger.warning(
+                    f"取价 reason=not_connected attempt={attempt}/{max_retries}, 尝试重连"
+                )
+                if not self._safe_reconnect():
+                    logger.error(
+                        f"取价 reason=reconnect_failed attempt={attempt}/{max_retries}"
+                    )
+                    continue
+
+            try:
+                price = self._poll_price_once(timeout)
+            except Exception as e:
+                logger.error(
+                    f"取价 reason=request_exception attempt={attempt}/{max_retries} err={e}, 尝试重连"
+                )
+                self._safe_reconnect()
+                continue
+
             if price is not None:
                 return price
-        logger.warning(f"{config.SYMBOL} 取价仍超时 (mdt={self._market_data_type_effective})")
+
+            # live (1) 首次 attempt 内 timeout → 降级 delayed (3) 重试一次
+            if self._market_data_type_effective == 1:
+                logger.warning(
+                    f"⚠️ {config.SYMBOL} live 行情 {timeout:.0f}s 无推送, "
+                    f"降级为 delayed(15min). 后续本进程都用 delayed, 重连会重新评估. "
+                    f"attempt={attempt}/{max_retries}"
+                )
+                self._apply_market_data_type(3, reason="live 超时自动降级")
+                try:
+                    price = self._poll_price_once(timeout)
+                except Exception as e:
+                    logger.error(
+                        f"取价 reason=request_exception (after degrade) "
+                        f"attempt={attempt}/{max_retries} err={e}, 尝试重连"
+                    )
+                    self._safe_reconnect()
+                    continue
+                if price is not None:
+                    return price
+
+            logger.warning(
+                f"取价 reason=timeout_no_quote attempt={attempt}/{max_retries} "
+                f"mdt={self._market_data_type_effective}"
+            )
+
         return None
 
-    def _poll_price_once(self, timeout_sec: float) -> Optional[float]:
-        """一次 reqMktData 轮询. 失败返回 None, 不改变降级状态."""
+    def _safe_reconnect(self) -> bool:
+        """reconnect 不让异常逸出, 避免在取价循环中再炸一次."""
         try:
-            ticker = self.ib.reqMktData(self.contract, '', False, False)
+            return bool(self.reconnect())
+        except Exception as e:
+            logger.error(f"reconnect 异常: {e}")
+            return False
+
+    def _poll_price_once(self, timeout_sec: float) -> Optional[float]:
+        """
+        一次 reqMktData 轮询. 找到报价返回 float, 超时无报价返回 None;
+        transport 层异常 (Socket disconnect 等) 直接抛出, 由上层 reconnect+retry.
+        无论成功 / 失败 / 超时, finally 中都会 cancelMktData 防止订阅泄漏.
+        """
+        ticker = self.ib.reqMktData(self.contract, '', False, False)
+        try:
             iterations = max(1, int(timeout_sec / 0.1))
             for _ in range(iterations):
                 self.ib.sleep(0.1)
                 if ticker.last and ticker.last > 0:
-                    self.ib.cancelMktData(self.contract)
                     return float(ticker.last)
                 if (ticker.bid and ticker.ask and
                         ticker.bid > 0 and ticker.ask > 0):
-                    mid = (ticker.bid + ticker.ask) / 2
-                    self.ib.cancelMktData(self.contract)
-                    return float(mid)
+                    return float((ticker.bid + ticker.ask) / 2)
                 if ticker.close and ticker.close > 0:
-                    self.ib.cancelMktData(self.contract)
                     return float(ticker.close)
             try:
                 mp = ticker.marketPrice()
                 if mp and mp > 0:
-                    self.ib.cancelMktData(self.contract)
                     return float(mp)
             except Exception:
                 pass
-            self.ib.cancelMktData(self.contract)
             return None
-        except Exception as e:
-            logger.error(f"获取价格异常: {e}")
-            return None
+        finally:
+            try:
+                self.ib.cancelMktData(self.contract)
+            except Exception:
+                pass
 
     def get_prev_close(self) -> Optional[float]:
         """

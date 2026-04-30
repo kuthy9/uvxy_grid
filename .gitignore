@@ -45,3 +45,10 @@ logs/
 
 # ───────── 历史数据保留, 但 parquet 缓存忽略 ─────────
 data/*.parquet
+
+# ───────── Alpaca 拉数脚本 (含 API key/secret, 不进 git) ─────────
+data/qqq.py
+
+# ───────── 项目内部文档 (本地用, 不发布到公共仓库) ─────────
+CLAUDE.md
+PROJECT_STATUS.md
