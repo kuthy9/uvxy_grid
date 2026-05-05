@@ -169,7 +169,7 @@ ENTRY_MAX_BB_WIDTH_PCT = 0.20          # QQQ-tuned: 0.10
 ENTRY_MIN_DAILY_VOLUME_USD = 1.0e6     # 日均成交额下限 (USD)
 ENTRY_BLACKOUT_DAYS_BEFORE_EARNINGS = 7
 ENTRY_BLACKOUT_DAYS_AFTER_EARNINGS = 1
-ENTRY_PRICE_BAND_ATR = 1.0
+ENTRY_PRICE_BAND_ATR = float(os.getenv("ENTRY_PRICE_BAND_ATR", "1.25"))
 # WAITING_ENTRY 等价格回到 EMA±1×ATR 入场带的最大 bar 数. 4h 周期下 1 bar=4h.
 # 设计取向: 进入 WAITING_ENTRY 后最多再给 1 根 bar 看 timing 是否进 band;
 # 没进就立刻回 SCANNING 重新评估, 不在旧 entry 上下文里挂久. 实践效果:
@@ -273,9 +273,20 @@ EARNINGS_FREEZE_DAYS_AFTER = 1
 EARNINGS_DATES = []
 
 # ════════════════════════════════════════════
-#  主循环频率 (SCANNING/WAITING 动态跟随 STRATEGY_INTERVAL)
+#  主循环频率
+#    - SCANNING:      跟随 STRATEGY_INTERVAL (4h 周期下每 4h 扫描一次)
+#    - WAITING_ENTRY: 与 STRATEGY_INTERVAL 解耦, 默认 300s (5min) — 这样进入
+#                     WAITING_ENTRY 后能在 5 分钟级别反复评估 timing,
+#                     而不是干等 4h. 本身不会延长 ENTRY_MAX_WAIT_BARS 的总等待
+#                     时间 (那个仍按 strategy bar 计), 只决定 "评估频率".
+#    - ACTIVE_GRID / EXIT_PENDING: 与策略周期无关, 用 ACTIVE_CHECK_INTERVAL_SEC.
 # ════════════════════════════════════════════
 ACTIVE_CHECK_INTERVAL_SEC = 60    # ACTIVE_GRID / EXIT_PENDING 下订单检查节拍, 与策略周期无关
+
+# WAITING_ENTRY 评估节拍 (秒). 默认 300s = 5min. 可通过环境变量覆盖以便实盘调节,
+# 不需要每次改代码. 设得太大 → 错过入场 band 内的窗口; 设得太小 → IBKR 取价频繁
+# 但单次取价代价低, 5min 是经验上够用的值.
+WAITING_ENTRY_CHECK_INTERVAL_SEC = int(os.getenv("WAITING_ENTRY_CHECK_INTERVAL_SEC", "300"))
 
 
 def scanning_interval_sec() -> int:
@@ -283,7 +294,14 @@ def scanning_interval_sec() -> int:
 
 
 def waiting_interval_sec() -> int:
-    return strategy_interval_seconds()
+    """WAITING_ENTRY 主循环 sleep 周期.
+
+    刻意与 strategy_interval_seconds() 解耦 — 历史 bug: 两者绑定在一起后,
+    STRATEGY_INTERVAL=4h 会让 WAITING_ENTRY 也每 4h 才检查一次, 入场信号
+    出现后系统先睡 4h 才尝试 timing, 等再醒来 timing 早已不在 band 内.
+    现在固定走 WAITING_ENTRY_CHECK_INTERVAL_SEC, 与策略周期独立.
+    """
+    return WAITING_ENTRY_CHECK_INTERVAL_SEC
 
 # ════════════════════════════════════════════
 #  数据

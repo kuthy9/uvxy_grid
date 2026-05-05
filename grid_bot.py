@@ -449,6 +449,16 @@ class GridBot:
                                           "条件满足")
             self._persist_all()
 
+            # 立即给一次 WAITING_ENTRY 评估机会 — 否则上层 main.py 会按
+            # waiting_interval_sec() 再 sleep 一段时间才进入 _handle_waiting_entry,
+            # 错过 "刚发现信号时 price 就在 band 内" 的瞬时入场窗口.
+            # 仅当 transition 真的成功切到 WAITING_ENTRY 时才调用 (防止意外递归).
+            if self.state_machine.state == SystemState.WAITING_ENTRY:
+                logger.info(
+                    "scanning→waiting: 立即触发一次 WAITING_ENTRY 评估 (避免 sleep 4h 后才看 timing)"
+                )
+                self._handle_waiting_entry()
+
     # ───────────────────────────────
     #  WAITING_ENTRY
     # ───────────────────────────────
@@ -470,9 +480,22 @@ class GridBot:
         """
         now = self.clock.now()
 
-        # ① 不在交易时段: 不消耗 WAITING_ENTRY 窗口
+        # ① 不在交易时段: 不消耗 WAITING_ENTRY 窗口.
+        # 关键: 仅 return 还不够 — entry_window_started_at 不动, 经过夜盘/周末后
+        # elapsed_bars 仍按 wall-clock 累加, 下次回到交易时段时直接超时. 因此把
+        # entry_window_started_at 推到 "now", 让 timeout 只统计交易时段累计耗时.
+        # (副作用: 跨 24h 多次非交易段调用都会 reset, 持续重置到最后一次非交易
+        #  评估的时间; 第一次进交易时段时 elapsed≈调度间隔, 不会立刻超时. 这是
+        #  设计预期 — "非交易时段不消耗窗口".)
         if not self.risk.check_trading_hours():
-            logger.debug("WAITING_ENTRY: 非交易时段, 跳过本次评估 (不消耗窗口)")
+            ctx = self.state_machine.context
+            if ctx.entry_window_started_at:
+                ctx.entry_window_started_at = now.isoformat()
+                try:
+                    self.state_machine.save_state(self.db.db_path)
+                except Exception as e:
+                    logger.warning(f"WAITING_ENTRY 非交易时段窗口推进持久化失败 (非致命): {e}")
+            logger.debug("WAITING_ENTRY: 非交易时段, 跳过本次评估 (窗口已推进, 不消耗)")
             return
 
         # 计算 elapsed_bars 仅用于日志 (实际超时由 state_machine.check_entry_timeout 决定)

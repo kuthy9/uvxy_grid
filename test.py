@@ -467,6 +467,38 @@ class TestConfigDynamicInterval(unittest.TestCase):
         with self.assertRaises(ValueError):
             config.strategy_interval_hours()
 
+    def test_waiting_interval_decoupled_from_strategy_interval(self):
+        """WAITING_ENTRY 节拍必须与 STRATEGY_INTERVAL 解耦.
+
+        历史 bug: 两者绑定后, STRATEGY_INTERVAL=4h 会让 WAITING_ENTRY 也 4h
+        才评估一次, 入场信号到 → 系统睡 4h → 醒来 timing 已脱离 band → 超时.
+        现在 waiting_interval_sec() 必须固定返回 WAITING_ENTRY_CHECK_INTERVAL_SEC.
+        """
+        # 默认值 (5min)
+        self.assertEqual(config.WAITING_ENTRY_CHECK_INTERVAL_SEC, 300)
+        for iv in ("15m", "1h", "4h", "1d"):
+            config.STRATEGY_INTERVAL = iv
+            self.assertEqual(config.waiting_interval_sec(),
+                             config.WAITING_ENTRY_CHECK_INTERVAL_SEC,
+                             f"interval={iv} 时 waiting_interval_sec 不应跟随 STRATEGY_INTERVAL")
+            # 与 scanning_interval 严格不同 (1d 例外: 86400 vs 300, 仍然不同)
+            self.assertNotEqual(config.waiting_interval_sec(),
+                                config.scanning_interval_sec(),
+                                f"interval={iv} 时 waiting/scanning 不应相同")
+
+    def test_state_machine_check_interval_uses_waiting_value(self):
+        """get_check_interval_sec 在 WAITING_ENTRY 状态下必须返回 5min 级别值,
+        而不是 strategy_interval_seconds. 这是 main.py sleep() 的入口."""
+        from state_machine import StateMachine, SystemState
+        from datetime import datetime as _dt
+        clock = MagicMock()
+        clock.now.return_value = _dt(2026, 5, 5, 10, 0)
+        sm = StateMachine(clock=clock)
+        sm.transition_to(SystemState.WAITING_ENTRY, "test", now=clock.now())
+        config.STRATEGY_INTERVAL = "4h"
+        self.assertEqual(sm.get_check_interval_sec(), config.WAITING_ENTRY_CHECK_INTERVAL_SEC)
+        self.assertNotEqual(sm.get_check_interval_sec(), config.strategy_interval_seconds())
+
 
 class TestIbkrPortLabel(unittest.TestCase):
     def test_known_ports(self):
@@ -1231,6 +1263,84 @@ class TestExecuteEntryPriceUnavailable(unittest.TestCase):
         self.assertEqual(first_arg, "EXECUTE_ENTRY_PRICE_UNAVAILABLE")
 
 
+class TestScanningImmediatelyHandsOffToWaiting(unittest.TestCase):
+    """scanning 检测到入场条件后, 必须在同一 step 立即触发一次 _handle_waiting_entry.
+
+    历史 bug: 转换到 WAITING_ENTRY 后只 return, 上层 main.py 立刻 sleep
+    waiting_interval_sec(); 历史上 waiting_interval_sec()=strategy_interval_seconds()=4h,
+    睡 4h 后才进 _handle_waiting_entry, 真正可入场的瞬时窗口已错过.
+
+    本测试与上面的 TestConfigDynamicInterval 互补 — 即使 waiting interval 缩到 5min,
+    也仍然存在 "刚发现信号 → 此刻 timing 满足 → 但要等 1 个 sleep 周期才尝试" 的延迟.
+    立即 hand-off 可消除这个延迟.
+    """
+
+    def _make_bot(self, conditions_passed: bool, timing_passed: bool):
+        from grid_bot import GridBot
+        clock = MagicMock()
+        clock.now.return_value = datetime(2026, 5, 5, 11, 0)
+
+        sm = StateMachine(clock=clock)
+        # 起点: SCANNING
+
+        bot = GridBot.__new__(GridBot)
+        bot.clock = clock
+        bot.state_machine = sm
+        bot.db = MagicMock()
+        bot.db.db_path = ":memory:"
+        bot.risk = MagicMock()
+        bot.risk.check_trading_hours.return_value = True
+        bot.data_fetcher = MagicMock()
+        bot.data_fetcher.get_strategy_data.return_value = MagicMock(
+            __len__=MagicMock(return_value=100)
+        )
+        bot.entry_filter = MagicMock()
+
+        eval_mock = MagicMock()
+        eval_mock.conditions_passed = conditions_passed
+        eval_mock.timing_passed = timing_passed
+        eval_mock.rejection_reasons = []
+        eval_mock.current_price = 37.82
+        eval_mock.adx_value = 15.0
+        eval_mock.atr_pct = 0.035
+        eval_mock.bb_width_pct = 0.10
+        eval_mock.ema_value = 37.78
+        bot.entry_filter.evaluate.return_value = eval_mock
+
+        bot.executor = MagicMock()
+        bot.grid = None
+        bot._base_position_shares = 0.0
+        bot._entry_execution_failures = 0
+        bot._last_scan_time = None
+        bot.strategy_df_days = 30
+        bot._persist_all = lambda: None
+        return bot
+
+    def test_scanning_triggers_immediate_waiting_evaluation(self):
+        """conditions_passed=True 的同一 step 内, _handle_waiting_entry 必须被调用."""
+        bot = self._make_bot(conditions_passed=True, timing_passed=False)
+
+        called = {"n": 0}
+        original_handler = bot._handle_waiting_entry if hasattr(bot, "_handle_waiting_entry") else None
+
+        def spy():
+            called["n"] += 1
+            # 不实际跑业务, 只验证被调用即可
+
+        bot._handle_waiting_entry = spy
+
+        bot._handle_scanning()
+        self.assertEqual(called["n"], 1, "scanning→waiting 应立即触发一次 waiting 评估")
+
+    def test_scanning_no_signal_does_not_call_waiting(self):
+        """没有信号时不应触发 _handle_waiting_entry."""
+        bot = self._make_bot(conditions_passed=False, timing_passed=False)
+        bot._handle_waiting_entry = MagicMock()
+        bot._handle_scanning()
+        bot._handle_waiting_entry.assert_not_called()
+        self.assertEqual(bot.state_machine.state, SystemState.SCANNING)
+
+
 class TestWaitingEntryAutoReset(unittest.TestCase):
     """
     waiting_entry 自动恢复: _execute_entry 返回 False 时累计计数,
@@ -1352,6 +1462,33 @@ class TestWaitingEntryAutoReset(unittest.TestCase):
         bot._execute_entry.assert_not_called()
         # 失败计数器没有动 (这条路径不属于执行失败)
         self.assertEqual(bot._entry_execution_failures, 0)
+
+    def test_non_trading_hours_pushes_window_forward(self):
+        """非交易时段必须把 entry_window_started_at 推到 now,
+        否则跨夜/周末后 elapsed_bars 已经累计很大, 回到交易时段就立即超时.
+        """
+        bot = self._make_bot()
+        bot.risk.check_trading_hours.return_value = False  # 非交易时段
+        # 状态: WAITING_ENTRY 已建立; 假设是夜里 22:00 ET
+        original_started = bot.state_machine.context.entry_window_started_at
+        self.assertIsNotNone(original_started)
+
+        # 时钟推到几小时后, 还是非交易时段
+        later = datetime.fromisoformat(original_started) + timedelta(hours=10)
+        bot.clock.now.return_value = later
+
+        # 持久化打桩: 不写 fs, 但要让分支确实尝试 save_state
+        bot.state_machine.save_state = MagicMock()
+
+        bot._handle_waiting_entry()
+
+        new_started = bot.state_machine.context.entry_window_started_at
+        self.assertIsNotNone(new_started)
+        self.assertEqual(new_started, later.isoformat(),
+                         "非交易时段应把窗口起点推到 now")
+        bot.state_machine.save_state.assert_called()
+        # 仍然停留在 WAITING_ENTRY (没有触发超时)
+        self.assertEqual(bot.state_machine.state, SystemState.WAITING_ENTRY)
 
     def test_timeout_boundary_epsilon_does_not_eat_window(self):
         """elapsed_bars 在 ENTRY_MAX_WAIT_BARS 边界上不应触发超时.
