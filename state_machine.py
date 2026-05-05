@@ -140,7 +140,12 @@ class StateMachine:
         return None
 
     def check_entry_timeout(self, current_time: Optional[datetime] = None) -> bool:
-        """检查WAITING_ENTRY是否超时"""
+        """检查WAITING_ENTRY是否超时.
+
+        引入 ENTRY_TIMEOUT_EPSILON_BARS 吸收浮点 / 调度漂移:
+        bar 边界处 (elapsed≈ENTRY_MAX_WAIT_BARS) 不应被判超时,
+        防止 WAITING_ENTRY 在第一次重新评估 timing 前就被消耗.
+        """
         if self.state != SystemState.WAITING_ENTRY:
             return False
         if not self.context.entry_window_started_at:
@@ -149,9 +154,10 @@ class StateMachine:
         started = datetime.fromisoformat(self.context.entry_window_started_at)
         strategy_hours = config.strategy_interval_hours()
         elapsed_bars = (current_time - started).total_seconds() / (strategy_hours * 3600)
-        if elapsed_bars > config.ENTRY_MAX_WAIT_BARS:
+        epsilon = float(getattr(config, "ENTRY_TIMEOUT_EPSILON_BARS", 1e-6))
+        if elapsed_bars > config.ENTRY_MAX_WAIT_BARS + epsilon:
             self.transition_to(SystemState.SCANNING,
-                               f"等待入场超时 ({elapsed_bars:.1f} bars)",
+                               f"等待入场超时 ({elapsed_bars:.2f} bars)",
                                now=current_time)
             return True
         return False

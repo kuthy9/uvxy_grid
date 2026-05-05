@@ -454,74 +454,155 @@ class GridBot:
     # ───────────────────────────────
 
     def _handle_waiting_entry(self):
+        """WAITING_ENTRY 主处理.
+
+        处理顺序 (重要 — 修改前请先读 README/CLAUDE 中关于 ENTRY_MAX_WAIT_BARS 的设计取向):
+          1. 不在交易时间 → 直接 return, 不消耗 WAITING_ENTRY 窗口, 不下单.
+          2. 重新拉数据 + entry_filter.evaluate.
+          3. conditions_passed=False → 回 SCANNING (reason="条件失效").
+          4. timing_passed=True     → 调 _execute_entry; 成功清零失败计数, 失败累加并按
+                                       ENTRY_EXECUTION_MAX_FAILURES 自动回 SCANNING.
+          5. timing_passed=False    → 记录详细日志, 然后再做 check_entry_timeout;
+                                       超时回 SCANNING (reason="等待超时"), 否则继续 WAITING.
+
+        关键: timeout 检查放在最后, 保证每个 bar 至少有一次完整的
+        entry/timing 评估机会, 避免因调度漂移让 WAITING_ENTRY 在第一次重新评估前就被消耗.
+        """
         now = self.clock.now()
-        old = self.state_machine.state.value
-        if self.state_machine.check_entry_timeout(current_time=now):
-            self.db.log_state_transition(old, self.state_machine.state.value,
-                                          "等待超时")
-            return
 
+        # ① 不在交易时段: 不消耗 WAITING_ENTRY 窗口
         if not self.risk.check_trading_hours():
+            logger.debug("WAITING_ENTRY: 非交易时段, 跳过本次评估 (不消耗窗口)")
             return
 
+        # 计算 elapsed_bars 仅用于日志 (实际超时由 state_machine.check_entry_timeout 决定)
+        started_iso = self.state_machine.context.entry_window_started_at
+        elapsed_bars = None
+        if started_iso:
+            try:
+                started = datetime.fromisoformat(started_iso)
+                strategy_hours = config.strategy_interval_hours()
+                elapsed_bars = (now - started).total_seconds() / (strategy_hours * 3600)
+            except Exception:
+                elapsed_bars = None
+        eb_str = f"{elapsed_bars:.3f}" if elapsed_bars is not None else "n/a"
+        logger.info(
+            f"WAITING_ENTRY 处理 | state={self.state_machine.state.value} "
+            f"| elapsed_bars={eb_str} / max={config.ENTRY_MAX_WAIT_BARS}"
+        )
+
+        # ② 重新评估
         try:
             strategy_df = self.data_fetcher.get_strategy_data(
                 config.SYMBOL, days=self.strategy_df_days
             )
             evaluation = self.entry_filter.evaluate(strategy_df, evaluation_time=now)
         except Exception as e:
-            logger.error(f"评估失败: {e}")
+            logger.error(f"WAITING_ENTRY 评估失败: {e}", exc_info=True)
             return
 
-        if not evaluation.conditions_passed:
+        cond_pass = bool(getattr(evaluation, "conditions_passed", False))
+        timing_pass = bool(getattr(evaluation, "timing_passed", False))
+        price = float(getattr(evaluation, "current_price", 0.0) or 0.0)
+        ema = float(getattr(evaluation, "ema_value", 0.0) or 0.0)
+        atr_pct = float(getattr(evaluation, "atr_pct", 0.0) or 0.0)
+        bb_width_pct = float(getattr(evaluation, "bb_width_pct", 0.0) or 0.0)
+        adx = float(getattr(evaluation, "adx_value", 0.0) or 0.0)
+        rejection_reasons = list(getattr(evaluation, "rejection_reasons", []) or [])
+
+        logger.info(
+            f"WAITING_ENTRY evaluation | conditions_passed={cond_pass} "
+            f"| timing_passed={timing_pass} | price={price:.4f} ema={ema:.4f} "
+            f"atr_pct={atr_pct*100:.3f}% bb_width_pct={bb_width_pct*100:.3f}% "
+            f"adx={adx:.2f}"
+        )
+
+        # ③ 条件失效: 立刻回 SCANNING
+        if not cond_pass:
             old = self.state_machine.state.value
             self.state_machine.on_entry_evaluation(
-                False, "; ".join(evaluation.rejection_reasons[:1]), now=now
+                False, "; ".join(rejection_reasons[:1]), now=now
             )
             self.db.log_state_transition(old, self.state_machine.state.value,
                                           "条件失效")
+            logger.info(
+                "WAITING_ENTRY → SCANNING (条件失效) | "
+                f"reasons={rejection_reasons[:3]}"
+            )
+            self._entry_execution_failures = 0
             self._persist_all()
             return
 
-        if not evaluation.timing_passed:
+        # ④ 时机满足: 执行入场
+        if timing_pass:
+            logger.info(
+                f"WAITING_ENTRY 准备执行入场 | price={price:.4f} ema={ema:.4f} "
+                f"atr_pct={atr_pct*100:.3f}%"
+            )
+            success = self._execute_entry(evaluation)
+            if success:
+                self._entry_execution_failures = 0
+                return
+
+            # 失败路径: 累加计数; 达到阈值就回 SCANNING.
+            self._entry_execution_failures += 1
+            threshold = max(1, int(getattr(config, "ENTRY_EXECUTION_MAX_FAILURES", 1)))
+            logger.warning(
+                f"_execute_entry 失败 {self._entry_execution_failures}/{threshold} "
+                f"(state={self.state_machine.state.value})"
+            )
+            if self._entry_execution_failures >= threshold:
+                old = self.state_machine.state.value
+                reason = (
+                    f"入场执行连续失败 {self._entry_execution_failures} 次, "
+                    f"自动回到扫描"
+                )
+                self.state_machine.transition_to(
+                    SystemState.SCANNING, reason, now=now
+                )
+                self.db.log_state_transition(
+                    old, self.state_machine.state.value, reason
+                )
+                log_risk_event = getattr(self.db, "log_risk_event", None)
+                if callable(log_risk_event):
+                    try:
+                        log_risk_event(
+                            "WAITING_ENTRY_AUTO_RESET",
+                            f"连续 {self._entry_execution_failures} 次入场执行失败",
+                            "自动回 SCANNING, 等待下一轮筛选"
+                        )
+                    except Exception as e:
+                        logger.warning(f"log_risk_event 失败 (非致命): {e}")
+                self._entry_execution_failures = 0
+                self._persist_all()
             return
 
-        success = self._execute_entry(evaluation)
-        if success:
-            self._entry_execution_failures = 0
-            return
-
-        # 失败路径: 累加计数; 达到阈值就回 SCANNING, 不在 waiting_entry 长期卡死.
-        self._entry_execution_failures += 1
-        threshold = max(1, int(getattr(config, "ENTRY_EXECUTION_MAX_FAILURES", 1)))
-        logger.warning(
-            f"_execute_entry 失败 {self._entry_execution_failures}/{threshold} "
-            f"(state={self.state_machine.state.value})"
+        # ⑤ 条件满足但 timing 未到: 记录日志再判超时
+        timing_reasons = [r for r in rejection_reasons if "EMA" in r or "K线" in r]
+        if not timing_reasons:
+            timing_reasons = rejection_reasons[-2:]
+        logger.info(
+            f"WAITING_ENTRY timing 未到 | price={price:.4f} ema={ema:.4f} "
+            f"atr_pct={atr_pct*100:.3f}% bb_width_pct={bb_width_pct*100:.3f}% "
+            f"adx={adx:.2f} | timing_reasons={timing_reasons}"
         )
-        if self._entry_execution_failures >= threshold:
-            old = self.state_machine.state.value
-            reason = (
-                f"入场执行连续失败 {self._entry_execution_failures} 次, "
-                f"自动回到扫描"
+
+        old = self.state_machine.state.value
+        if self.state_machine.check_entry_timeout(current_time=now):
+            self.db.log_state_transition(old, self.state_machine.state.value,
+                                          "等待超时")
+            logger.info(
+                f"WAITING_ENTRY → SCANNING (等待超时) | elapsed_bars={eb_str} "
+                f"max={config.ENTRY_MAX_WAIT_BARS}"
             )
-            self.state_machine.transition_to(
-                SystemState.SCANNING, reason, now=now
-            )
-            self.db.log_state_transition(
-                old, self.state_machine.state.value, reason
-            )
-            log_risk_event = getattr(self.db, "log_risk_event", None)
-            if callable(log_risk_event):
-                try:
-                    log_risk_event(
-                        "WAITING_ENTRY_AUTO_RESET",
-                        f"连续 {self._entry_execution_failures} 次入场执行失败",
-                        "自动回 SCANNING, 等待下一轮筛选"
-                    )
-                except Exception as e:
-                    logger.warning(f"log_risk_event 失败 (非致命): {e}")
             self._entry_execution_failures = 0
             self._persist_all()
+            return
+
+        logger.info(
+            f"WAITING_ENTRY 继续等待 | elapsed_bars={eb_str} "
+            f"max={config.ENTRY_MAX_WAIT_BARS}"
+        )
 
     def _execute_entry(self, evaluation):
         """市价单建底仓, 偏差>1.5% 回滚"""

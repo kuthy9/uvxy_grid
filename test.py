@@ -1323,8 +1323,15 @@ class TestWaitingEntryAutoReset(unittest.TestCase):
         self.assertEqual(bot._entry_execution_failures, 0)
 
     def test_check_entry_timeout_still_triggers_scanning(self):
-        """新计数器逻辑不能压制原有 ENTRY_MAX_WAIT_BARS 超时返扫描的链路."""
+        """新顺序下: 即使 timing 未到, 超过 ENTRY_MAX_WAIT_BARS 仍应回 SCANNING."""
         bot = self._make_bot()
+
+        # 关键: 这条路径要求 conditions_passed=True 但 timing_passed=False,
+        # 否则会先走 _execute_entry 分支, 不会到 timeout 检查.
+        bot.entry_filter.evaluate.return_value.timing_passed = False
+        bot.entry_filter.evaluate.return_value.rejection_reasons = [
+            "价格$10.00 偏离EMA $9.00 达 2.00×ATR"
+        ]
 
         # 把窗口起点拨回去, 让 check_entry_timeout 触发
         started = bot.state_machine.context.entry_window_started_at
@@ -1336,7 +1343,7 @@ class TestWaitingEntryAutoReset(unittest.TestCase):
         )
         bot.clock.now.return_value = far_future
 
-        # _execute_entry 不应被调用 — check_entry_timeout 在它之前就 return 了
+        # _execute_entry 不应被调用 — timing_passed=False, 走 timeout 路径
         bot._execute_entry = MagicMock(return_value=False)
 
         bot._handle_waiting_entry()
@@ -1345,6 +1352,40 @@ class TestWaitingEntryAutoReset(unittest.TestCase):
         bot._execute_entry.assert_not_called()
         # 失败计数器没有动 (这条路径不属于执行失败)
         self.assertEqual(bot._entry_execution_failures, 0)
+
+    def test_timeout_boundary_epsilon_does_not_eat_window(self):
+        """elapsed_bars 在 ENTRY_MAX_WAIT_BARS 边界上不应触发超时.
+
+        重现 V49 实盘观察: T0 进 WAITING_ENTRY, 4h 后第一次重新评估时
+        elapsed≈1.0 (ENTRY_MAX_WAIT_BARS=1), 因浮点/调度漂移可能极微略大于 1.0.
+        新增的 ENTRY_TIMEOUT_EPSILON_BARS 必须吸收 sub-bar 量级的漂移,
+        让 timing 有机会被评估.
+        """
+        bot = self._make_bot()
+        bot.entry_filter.evaluate.return_value.timing_passed = False
+        bot.entry_filter.evaluate.return_value.rejection_reasons = [
+            "价格偏离EMA"
+        ]
+
+        started = bot.state_machine.context.entry_window_started_at
+        self.assertIsNotNone(started)
+        strategy_hours = config.strategy_interval_hours()
+        # 漂移设为 epsilon 的 1/10, 远小于 epsilon → 必须被吸收, 不触发超时
+        epsilon_bars = float(getattr(config, "ENTRY_TIMEOUT_EPSILON_BARS", 1e-6))
+        drift_seconds = (epsilon_bars / 10.0) * strategy_hours * 3600
+        boundary = (
+            datetime.fromisoformat(started)
+            + timedelta(hours=config.ENTRY_MAX_WAIT_BARS * strategy_hours)
+            + timedelta(seconds=drift_seconds)
+        )
+        bot.clock.now.return_value = boundary
+        bot._execute_entry = MagicMock(return_value=False)
+
+        bot._handle_waiting_entry()
+
+        # 期望仍然在 WAITING_ENTRY (epsilon 吸收了漂移)
+        self.assertEqual(bot.state_machine.state, SystemState.WAITING_ENTRY)
+        bot._execute_entry.assert_not_called()
 
 
 if __name__ == "__main__":

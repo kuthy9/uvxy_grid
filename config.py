@@ -173,11 +173,16 @@ ENTRY_PRICE_BAND_ATR = 1.0
 # WAITING_ENTRY 等价格回到 EMA±1×ATR 入场带的最大 bar 数. 4h 周期下 1 bar=4h.
 # 设计取向: 进入 WAITING_ENTRY 后最多再给 1 根 bar 看 timing 是否进 band;
 # 没进就立刻回 SCANNING 重新评估, 不在旧 entry 上下文里挂久. 实践效果:
-#   - T0 进 WAITING_ENTRY → T0+4h 评估一次 (此时 elapsed=1.0, 不触发超时, 看 timing)
+#   - T0 进 WAITING_ENTRY → T0+4h 评估一次 (此时 elapsed≈1.0, 不触发超时, 看 timing)
 #   - T0+8h 再评估时 elapsed=2.0 > 1.0 → check_entry_timeout 触发回 SCANNING
 # 即"最多挂一个 4h bar"窗口, 短到与 SCANNING 几乎等价但保留一次额外 timing 机会.
-# 实盘观察后若发现 timing 命中比例过低可调大.
-ENTRY_MAX_WAIT_BARS = 1
+# 实盘观察后若发现 timing 命中比例过低可调大. 可通过环境变量覆盖.
+ENTRY_MAX_WAIT_BARS = float(os.getenv("ENTRY_MAX_WAIT_BARS", "1"))
+
+# 浮点边界误差吸收带 (单位: bar). check_entry_timeout 对比 elapsed_bars 时使用,
+# 防止主循环调度漂移让 elapsed 略大于 ENTRY_MAX_WAIT_BARS 而提早超时,
+# 在 timing 还没机会被重新评估前就把 WAITING_ENTRY 消耗掉.
+ENTRY_TIMEOUT_EPSILON_BARS = float(os.getenv("ENTRY_TIMEOUT_EPSILON_BARS", "1e-6"))
 
 # WAITING_ENTRY 下 _execute_entry 返回 False 的连续次数阈值;
 # 触发后自动回 SCANNING, 防止取价/下单/成交异常把状态长期卡在 waiting_entry,
