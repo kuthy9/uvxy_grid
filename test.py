@@ -1525,5 +1525,175 @@ class TestWaitingEntryAutoReset(unittest.TestCase):
         bot._execute_entry.assert_not_called()
 
 
+class TestDailySnapshotWriting(unittest.TestCase):
+    """daily_snapshots 必须独立于周报: 每个交易日一次 + 关键事件刷新.
+
+    历史 bug: 仅 _generate_weekly_report() 调用 db.log_daily_snapshot,
+    导致工作日有交易也不会产生当天 snapshot, 周一前的成交都看不到当日权益变化.
+    修复后: 每个交易日 step() 中至少写一次, 关键事件 (entry/fill/exit/紧急清仓)
+    都强制刷新当天 snapshot.
+    """
+
+    def _make_bot(self, now=None):
+        from grid_bot import GridBot
+        clock = MagicMock()
+        clock.now.return_value = now or datetime(2026, 5, 6, 14, 30)
+
+        sm = StateMachine(clock=clock)
+
+        bot = GridBot.__new__(GridBot)
+        bot.clock = clock
+        bot.state_machine = sm
+        bot.db = MagicMock()
+        bot.db.db_path = ":memory:"
+        bot.risk = MagicMock()
+        bot.risk.check_trading_hours.return_value = True
+        bot.risk.is_hard_stopped.return_value = False
+        bot.risk.can_trade.return_value = True
+        bot.risk.record_intraday_price = MagicMock()
+        bot.entry_filter = MagicMock()
+        bot.data_fetcher = MagicMock()
+
+        bot.executor = MagicMock()
+        bot.executor.is_connected.return_value = True
+        bot.executor.get_position_details.return_value = {
+            "shares": 115.0,
+            "market_value": 115 * 36.04,
+            "unrealized_pnl": -2.0,
+        }
+        bot.executor.get_account_summary.return_value = {
+            "NetLiquidation": 9985.0,
+            "TotalCashValue": 5841.4,
+        }
+        bot.executor.get_realized_pnl.return_value = 0.0
+        bot.executor.get_cash.return_value = 5841.4
+
+        bot.grid = None
+        bot._base_position_shares = 0.0
+        bot._entry_execution_failures = 0
+        bot._last_scan_time = None
+        bot._last_recenter_check = None
+        bot._last_weekly_report_week = None
+        bot._last_snapshot_date = None
+        bot.strategy_df_days = 30
+        bot.pnl = MagicMock()
+        bot.pnl.get_today_pnl.return_value = 0.0
+        bot.pnl.get_queue_summary.return_value = {
+            "total_qty": 0.0, "avg_price": 0.0, "count": 0,
+        }
+        bot._persist_all = lambda: None
+        return bot
+
+    def test_log_daily_snapshot_now_writes_with_correct_fields(self):
+        """_log_daily_snapshot_now 应调用 db.log_daily_snapshot 且字段反映当前快照."""
+        bot = self._make_bot()
+        bot._log_daily_snapshot_now(reason="unit_test")
+        self.assertEqual(bot.db.log_daily_snapshot.call_count, 1)
+        kwargs = bot.db.log_daily_snapshot.call_args.kwargs
+        self.assertEqual(kwargs["state"], "scanning")
+        self.assertAlmostEqual(kwargs["position_shares"], 115.0)
+        self.assertAlmostEqual(kwargs["total_equity"], 9985.0, places=2)
+        self.assertAlmostEqual(kwargs["cash"], 5841.4, places=2)
+        # 没有网格时 grid_center=0
+        self.assertEqual(kwargs["grid_center"], 0.0)
+
+    def test_log_daily_snapshot_now_uses_grid_center_when_active(self):
+        """有 grid 时, snapshot.grid_center 应为 grid.center_price."""
+        bot = self._make_bot()
+        bot.grid = MagicMock()
+        bot.grid.center_price = 37.10
+        bot._log_daily_snapshot_now(reason="entry_complete")
+        kwargs = bot.db.log_daily_snapshot.call_args.kwargs
+        self.assertAlmostEqual(kwargs["grid_center"], 37.10, places=2)
+
+    def test_maybe_log_daily_snapshot_writes_once_per_date(self):
+        """同一交易日多次调用 _maybe_log_daily_snapshot 只写一次."""
+        bot = self._make_bot(now=datetime(2026, 5, 6, 9, 35))
+        bot._maybe_log_daily_snapshot()
+        self.assertEqual(bot.db.log_daily_snapshot.call_count, 1)
+        bot._maybe_log_daily_snapshot()
+        self.assertEqual(bot.db.log_daily_snapshot.call_count, 1)
+
+    def test_maybe_log_daily_snapshot_writes_again_on_next_day(self):
+        """跨入下一交易日, _maybe_log_daily_snapshot 必须再写一次."""
+        bot = self._make_bot(now=datetime(2026, 5, 6, 14, 0))
+        bot._maybe_log_daily_snapshot()
+        self.assertEqual(bot.db.log_daily_snapshot.call_count, 1)
+        bot.clock.now.return_value = datetime(2026, 5, 7, 9, 35)
+        bot._maybe_log_daily_snapshot()
+        self.assertEqual(bot.db.log_daily_snapshot.call_count, 2)
+
+    def test_snapshot_written_after_successful_entry(self):
+        """_execute_entry 成功后, 当天 daily_snapshot 必须刷新且 state=active_grid."""
+        bot = self._make_bot()
+        # on_grid_active 要求当前在 WAITING_ENTRY 才会转换到 ACTIVE_GRID
+        bot.state_machine.transition_to(
+            SystemState.WAITING_ENTRY, "test fixture", now=bot.clock.now()
+        )
+        bot.executor.get_current_price.return_value = 36.04
+        bot.executor.place_market_order.return_value = "oid1"
+        bot.executor.wait_for_order_fill.return_value = {
+            "quantity": 105.0, "fill_price": 36.04, "commission": 0.35,
+        }
+        eval_mock = MagicMock()
+        eval_mock.suggested_center = 37.10
+        eval_mock.suggested_atr = 1.50
+        eval_mock.suggested_spacing_pct = 0.012
+
+        ok = bot._execute_entry(eval_mock)
+        self.assertTrue(ok)
+        bot.db.log_daily_snapshot.assert_called()
+        states = [c.kwargs.get("state")
+                  for c in bot.db.log_daily_snapshot.call_args_list]
+        self.assertIn("active_grid", states)
+
+    def test_snapshot_written_after_grid_fill(self):
+        """ACTIVE_GRID 中检测到成交, 当天 snapshot 必须刷新."""
+        bot = self._make_bot()
+        bot.state_machine.transition_to(
+            SystemState.WAITING_ENTRY, "test", now=bot.clock.now()
+        )
+        bot.state_machine.on_grid_active(now=bot.clock.now())
+        bot.grid = MagicMock()
+        bot.grid.center_price = 37.10
+        bot.grid.check_signals.return_value = []
+        bot.grid.check_filled_resets = MagicMock()
+        bot.grid.mark_order_filled = MagicMock()
+        bot.executor.check_order_fills.return_value = [{
+            "level_index": -1, "fill_price": 36.03, "quantity": 10.0,
+            "action": "BUY", "order_id": "oid2", "order_type": "GRID_BUY",
+            "commission": 0.35,
+        }]
+        bot.executor.get_current_price.return_value = 36.05
+        bot._should_check_dynamic_adjustment = lambda: False
+
+        bot._handle_active_grid()
+        bot.db.log_daily_snapshot.assert_called()
+
+    def test_snapshot_written_after_finalize_exit(self):
+        """EXIT 完成 → daily snapshot 必须刷新 (反映 SCANNING + 空仓状态)."""
+        bot = self._make_bot()
+        bot.executor.get_position_details.return_value = {
+            "shares": 0.0, "market_value": 0.0, "unrealized_pnl": 0.0,
+        }
+        bot.state_machine.transition_to(
+            SystemState.WAITING_ENTRY, "test", now=bot.clock.now()
+        )
+        bot.state_machine.on_grid_active(now=bot.clock.now())
+        bot.state_machine.on_exit_signal(True, "test_exit", now=bot.clock.now())
+
+        bot._finalize_exit()
+        bot.db.log_daily_snapshot.assert_called()
+
+    def test_snapshot_failure_is_non_fatal(self):
+        """db.log_daily_snapshot 抛错不应让 _log_daily_snapshot_now 冒泡崩溃."""
+        bot = self._make_bot()
+        bot.db.log_daily_snapshot.side_effect = RuntimeError("disk full")
+        try:
+            bot._log_daily_snapshot_now(reason="boom")
+        except Exception as e:  # pragma: no cover
+            self.fail(f"_log_daily_snapshot_now 不应抛出异常, got: {e}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

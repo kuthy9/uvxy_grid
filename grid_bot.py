@@ -91,6 +91,9 @@ class GridBot:
         self._last_scan_time: Optional[datetime] = None
         self._last_recenter_check: Optional[datetime] = None
         self._last_weekly_report_week: Optional[tuple] = None  # (iso_year, iso_week)
+        # daily_snapshots 防重复 — 当天写过一次后, _maybe_log_daily_snapshot
+        # 不再重复触发. 关键事件 (_log_daily_snapshot_now) 仍然会覆盖当天记录.
+        self._last_snapshot_date: Optional[date] = None
         self._base_position_shares = 0.0
         # 连续 _execute_entry 失败计数; 达到 config.ENTRY_EXECUTION_MAX_FAILURES
         # 时自动回 SCANNING, 避免 waiting_entry 长期卡死.
@@ -408,6 +411,8 @@ class GridBot:
         elif state == SystemState.EXIT_PENDING:
             self._handle_exit_pending()
 
+        # 每个交易日首次循环写一次账户快照 (与周报解耦)
+        self._maybe_log_daily_snapshot()
         self._maybe_generate_weekly_report()
 
     # ───────────────────────────────
@@ -719,6 +724,7 @@ class GridBot:
             f"建仓完成 中轴${evaluation.suggested_center:.2f}"
         )
         self._persist_all()
+        self._log_daily_snapshot_now(reason="entry_complete")
         return True
 
     def _rollback_partial_base_entry(self, partial_qty: float, progress: dict):
@@ -774,7 +780,9 @@ class GridBot:
         # 1. 检查成交
         filled = self.executor.check_order_fills()
         grid_state_dirty = False
+        had_fill = False
         for f in filled:
+            had_fill = True
             grid_state_dirty = True
             self.grid.mark_order_filled(
                 f["level_index"], f["fill_price"],
@@ -867,6 +875,10 @@ class GridBot:
 
         if grid_state_dirty:
             self._persist_all()
+
+        # 任何成交后刷新当日 snapshot — 反映最新 position_shares / cash / unrealized
+        if had_fill:
+            self._log_daily_snapshot_now(reason="grid_fill")
 
     def _should_check_dynamic_adjustment(self) -> bool:
         """按策略周期 (4h) 检查, 不是每分钟"""
@@ -1052,6 +1064,7 @@ class GridBot:
                                       "清仓完成")
         self.pnl.save_state()
         self._persist_all()
+        self._log_daily_snapshot_now(reason="exit_complete")
 
     # ───────────────────────────────
     #  紧急清仓
@@ -1154,6 +1167,7 @@ class GridBot:
             f"清{filled:.4f}@${fill_price:.2f} 佣${total_com:.2f}",
             "硬止损 队列已清"
         )
+        self._log_daily_snapshot_now(reason="emergency_liquidate")
         self._running = False
 
     def _emergency_clear_fifo(self, fallback_price: float):
@@ -1171,6 +1185,72 @@ class GridBot:
             f"兜底价${fallback_price:.2f}清{count}笔",
             "PnL可能不准"
         )
+
+    # ───────────────────────────────
+    #  daily_snapshots 写入
+    # ───────────────────────────────
+
+    def _log_daily_snapshot_now(self, reason: str = "") -> None:
+        """覆盖当日 daily_snapshot.
+
+        触发时机:
+          - 主循环每个新交易日的第一次步进 (_maybe_log_daily_snapshot)
+          - 底仓建仓完成 → ACTIVE_GRID 之后
+          - 网格 BUY/SELL 成交后 (_handle_active_grid)
+          - EXIT 完成 (_finalize_exit)
+          - 紧急清仓 (_emergency_liquidate)
+          - 周报生成时 (兼容旧路径)
+
+        覆盖语义由 trade_logger.log_daily_snapshot 的
+        INSERT OR REPLACE + UNIQUE(date) 保证, 同一天多次写入只保留最新一条.
+        失败不致命, 只写一行警告日志.
+        """
+        try:
+            pos = self.executor.get_position_details() or {}
+            summary = self.executor.get_account_summary() or {}
+            equity = float(summary.get("NetLiquidation", 0) or 0)
+            cash = float(summary.get("TotalCashValue", 0) or 0)
+            shares = float(pos.get("shares", 0) or 0)
+            position_value = float(pos.get("market_value", 0) or 0)
+            unrealized = float(pos.get("unrealized_pnl", 0) or 0)
+            try:
+                today_pnl = float(self.pnl.get_today_pnl() or 0)
+            except Exception:
+                today_pnl = 0.0
+            grid_center = float(self.grid.center_price) if self.grid else 0.0
+            state_value = self.state_machine.state.value
+
+            self.db.log_daily_snapshot(
+                state=state_value,
+                total_equity=equity,
+                position_shares=shares,
+                position_value=position_value,
+                cash=cash,
+                unrealized_pnl=unrealized,
+                realized_pnl_today=today_pnl,
+                grid_center=grid_center,
+                note=reason,
+            )
+            self._last_snapshot_date = self.clock.now().date()
+            logger.info(
+                f"📸 daily snapshot updated | reason={reason or 'periodic'} "
+                f"| state={state_value} | shares={shares:.2f} "
+                f"| equity=${equity:,.2f} | cash=${cash:,.2f} "
+                f"| grid_center=${grid_center:.2f}"
+            )
+        except Exception as e:
+            logger.warning(f"daily snapshot 写入失败 (非致命): {e}")
+
+    def _maybe_log_daily_snapshot(self) -> None:
+        """主循环节拍调用: 每个新交易日的第一次步进写一次 snapshot.
+
+        关键事件 (entry/fill/exit/紧急清仓) 直接调 _log_daily_snapshot_now,
+        不依赖这里. 这里只负责 "无事件的 idle 日子也要留下当天权益记录".
+        """
+        today = self.clock.now().date()
+        if self._last_snapshot_date == today:
+            return
+        self._log_daily_snapshot_now(reason="daily_periodic")
 
     # ───────────────────────────────
     #  周报 (每周一 16:30 ET)
@@ -1215,23 +1295,13 @@ class GridBot:
     def _generate_weekly_report(self):
         """生成周报快照"""
         try:
+            # 当日 snapshot 走统一入口, 避免与主循环/事件触发的写入逻辑漂移
+            self._log_daily_snapshot_now(reason="weekly_report")
+
             pos = self.executor.get_position_details()
             summary = self.executor.get_account_summary()
             cash = summary.get("TotalCashValue", 0)
             equity = summary.get("NetLiquidation", 0)
-
-            today_pnl = self.pnl.get_today_pnl()
-
-            self.db.log_daily_snapshot(
-                state=self.state_machine.state.value,
-                total_equity=equity,
-                position_shares=pos["shares"],
-                position_value=pos["market_value"],
-                cash=cash,
-                unrealized_pnl=pos.get("unrealized_pnl", 0),
-                realized_pnl_today=today_pnl,
-                grid_center=self.grid.center_price if self.grid else 0,
-            )
 
             self.pnl.save_state()
 
