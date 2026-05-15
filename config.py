@@ -231,7 +231,7 @@ ENTRY_PRICE_BAND_ATR = float(os.getenv("ENTRY_PRICE_BAND_ATR", "1.25"))
 #   - T0+8h 再评估时 elapsed=2.0 > 1.0 → check_entry_timeout 触发回 SCANNING
 # 即"最多挂一个 4h bar"窗口, 短到与 SCANNING 几乎等价但保留一次额外 timing 机会.
 # 实盘观察后若发现 timing 命中比例过低可调大. 可通过环境变量覆盖.
-ENTRY_MAX_WAIT_BARS = float(os.getenv("ENTRY_MAX_WAIT_BARS", "1.5"))
+ENTRY_MAX_WAIT_BARS = float(os.getenv("ENTRY_MAX_WAIT_BARS", "12"))  # 2026-05-15: V49 default 12 恢复, walk-forward 验证过
 
 # 浮点边界误差吸收带 (单位: bar). check_entry_timeout 对比 elapsed_bars 时使用,
 # 防止主循环调度漂移让 elapsed 略大于 ENTRY_MAX_WAIT_BARS 而提早超时,
