@@ -248,4 +248,54 @@ UVXY 真实 edge 是"长 hold + ADX>22 时 grid_engine 高位 EXIT", 战术化�
 
 **Nuance (按 B3b/B3c)**: 战术化 S2 (零成交超时退出) 在 UVXY 上"能工作 + 真短线 + 绝对盈利", 但跑输 baseline. 这不构成 plan §2 命题 B 的反例.
 
+---
+
+## F9. 多标的并行 + V49 Default 恢复 + Walk-Forward 验证 (2026-05-15 会话 4)
+
+三步串行验证多标的 UVXY+VXX 50/50 可行性，完整证据链见 [`reports/multi_symbol_alpha.md`](./reports/multi_symbol_alpha.md).
+
+**D 整体 Verdict: ✅ 推荐多标的 UVXY+VXX 50/50 作为新 default 候选**
+
+### 关键数据
+
+**Step 1 — VXX Walk-Forward (Gate 1): ✅ PASS**
+- 8 个 13 个月滚动窗口，7/8 盈利 (87.5%)，中位 +9.93%
+- 最佳 win3 (2022-12-23 → 2024-01-17): +218.39%
+- 最差 win4 (2023-07-06 → 2024-07-30): -11.32%
+
+**Step 2 — ENTRY_MAX_WAIT_BARS 假设错 (意外发现)**
+- spec §1 假设: `ENTRY_MAX_WAIT_BARS` 12 → 1.5 是 V49 → HEAD -27pp 回归的部分原因
+- 实测: 改 default 12 后 4 组 sanity backtest 回报**完全相同** (UVXY OFF +82.81% / VXX OFF +226.79%)
+- 根本原因: 该参数控制实盘 main loop 节拍等待，不影响回测 bar-by-bar 决策逻辑
+- V49 → HEAD -27pp 真实来源仍未定位，需独立 git-bisect
+
+**Step 3 — 多标的 UVXY+VXX 50/50 (Gate 3): ✅ PASS**
+
+全周期 (5y, $10k):
+
+| 指标 | 值 |
+|---|---|
+| 合并 total ret | **+153.93%** |
+| 年化 | +20.78% |
+| MDD | 15.09% |
+| UVXY sub ($5k) | +70.38% |
+| VXX sub ($5k) | +237.48% |
+
+Walk-Forward (8 窗口): 5/8 正向, 中位 +15.89%, 最佳 +120.47% (win3), 最差 -9.19% (win7)
+
+Gate 矩阵:
+- Gate 3.1 (≥ 4/8 正向 + 中位 > 0): ✅ PASS (5/8, +15.89%)
+- Gate 3.2 (ret > +82.81%): ✅ PASS (+153.93%)
+
+### 关键 Bug 修复 (risk_manager 多标的 capital 基准错误)
+
+`risk_manager.check_hard_stop` / `check_position_limit` 在多标的场景下错用 `config.TOTAL_CAPITAL` ($10k) 作 baseline，导致 $5k sub-bot 启动即被 hard_stop 强制清算。修复：引入 `_capital_reference()` helper，多标的时返回 `allocated_capital`，单标的退化到 `TOTAL_CAPITAL`（向后兼容）。6 层风控其他逻辑 0 改动，Code quality review (Opus) APPROVE.
+
+### 未做的事 (诚实声明)
+
+- V49 → HEAD -27pp 回归真实根本原因仍未 git-bisect 定位
+- `run_multi_backtest.py` 仅为回测驱动；实盘多标的上线需 `bot_factory` + `ibkr_executor` 适配 + paper trading 4 周对账
+- 其他周期 (1h/1d) 多标的行为未测试
+- `BT_*` 参数未与 paper trading 对账
+
 **结论保持**: `config.TURBO_ENABLED` 默认 OFF (P9), EXPERIMENTAL banner (P9), 中性 regression test (P9) 都仍是正确决策.

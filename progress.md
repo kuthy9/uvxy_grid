@@ -105,3 +105,46 @@
 
 ### 测试状态
 252/252 全绿 (与会话 2 终态一致, 本次未改业务代码).
+
+---
+
+## 2026-05-15 会话 4 — 多标的并行 + V49 Default 恢复 + Walk-Forward
+
+**Implementation Plan**: `docs/superpowers/plans/2026-05-15-multi-symbol-alpha.md`
+**Design Spec**: `docs/superpowers/specs/2026-05-15-multi-symbol-alpha-design.md`
+
+### Commits (按顺序)
+
+| Task | Commit | 说明 |
+|---|---|---|
+| D1 | 97cdbc6 | scripts/walk_forward_fixed.py + UVXY smoke test (8 窗口, 5/8 positive) |
+| D2 | ca345e3 | VXX walk-forward Gate 1 PASS (7/8 positive, 中位 +9.93%) |
+| D3 | 8daa751 | config: ENTRY_MAX_WAIT_BARS default 1.5 → 12 (V49 恢复; 意外发现: 对回测路径无影响) |
+| D4 | 3e10473 | scripts/run_multi_backtest.py + 单标的退化 smoke test (delta < 0.01pp) |
+| D5 | 76ebb4d | UVXY+VXX 50/50: 全周期 +153.93% + 8 窗口 WF 5/8 正向 + risk_manager bug 修复 |
+| D6 | (本次) | reports/multi_symbol_alpha.md + findings F9 + progress 会话 4 |
+
+### D 整体 Verdict
+
+**Step 1 (VXX walk-forward gate)**: ✅ PASS (7/8 正向, 中位 +9.93%)
+**Step 2 (V49 default 恢复)**: ⚠️ Borderline — default 改了但实测对回测无影响; V49 -27pp 回归真实来源仍未定位
+**Step 3 (多标的 50/50)**: ✅ PASS (+153.93% full 5y, 5/8 WF 正向, MDD 15.09%)
+**整体**: ✅ 推荐多标的 UVXY+VXX 50/50 作为新 default 候选
+
+### 主要数据
+
+- 多标的 5y 合并: +153.93% (年化 +20.78%, MDD 15.09%)
+- UVXY sub ($5k): +70.38%, VXX sub ($5k): +237.48%
+- Walk-Forward 8 窗口: 5/8 正向, 中位 +15.89%, 最佳 +120.47% (win3), 最差 -9.19% (win7)
+- risk_manager bug 修复: `_capital_reference()` helper 解决多标的 hard_stop baseline 错用全局 TOTAL_CAPITAL 问题
+
+### 测试状态
+252/252 全绿 (risk_manager 修复后 single-symbol 回归不变, test.py 全绿).
+
+### 未做的事 (诚实声明)
+
+1. V49 → HEAD -27pp 真实根本原因仍未 git-bisect (ENTRY_MAX_WAIT_BARS 已排除, 其他候选未追查)
+2. `run_multi_backtest.py` 是回测驱动; 实盘多标的需 `bot_factory` + `ibkr_executor` 适配 + paper trading ≥ 4 周对账
+3. `BT_*` 成本参数未与实盘对账 (属于 CLAUDE.md §8 优先级 2, 独立任务)
+4. 多标的异常熔断机制未实现 (属于 CLAUDE.md §8 优先级 3, 独立任务)
+5. 其他周期 (1h/1d) 多标的行为未测试
