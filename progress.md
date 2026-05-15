@@ -76,3 +76,32 @@
 1. Code quality review P1 阶段 3 个 Important issue 未修 (config.py L209 stale "默认改 -1000" comment / entry_filter.py getattr fallback `-1.0` vs config `-0.5` / T1+S3 入场过滤缺单测) — 这些是上轮战术化遗留, 不在本轮 spec 范围.
 2. CLAUDE.md §1 "4 状态 FSM" 描述过时未改 (用户明确要求).
 3. V49 -29pp 回归未 git-bisect (独立 issue, 与本命题正交).
+
+---
+
+## 2026-05-15 会话 3 — 扩展筛选 (50 候选) + 多标的回测
+
+**Implementation Plan**: `docs/superpowers/plans/2026-05-15-tactical-extended-screening.md`
+
+### Commits (按顺序)
+| Task | 说明 |
+|---|---|
+| E1 | screen_symbols.py CANDIDATES 15 → 50 (加杠杆 ETF + 高波动单股 + option income ETF + VIX) |
+| E2 | yfinance 50 标的 screen + Part 1B 4 条规则 → 5/50 全过 (UVXY, RIOT, SOXL, SOXS, MARA) |
+| E3 | data/multi_pull.py + Alpaca 拉 RIOT/SOXL/SOXS/MARA 4h 5y 数据 (各 ~3000 bars) |
+| E4 | scripts/run_baseline_grid.py + 6 标的 × {ON, OFF} = 12 backtest baseline |
+| E5 | Top-3 (MARA/SOXL/RIOT) × full sweep (single 50 + joint 54-81 + cost 8) ≈ 390 trial |
+| E6 | reports/tactical_extended_screening.md 完整 report (Part 1-6) |
+| E7 | findings.md F8 + progress.md 会话 3 + commit (本次) |
+
+### 主要数据 (5 标的累计 641 trial)
+- **B3a (≥ baseline) 反例**: 12 个 (UVXY/VXX 0, MARA 6 / SOXL 5 / RIOT 1) — 全部 trade ret ≤ +0.74%, 反例本质"战术化让大亏变小亏"
+- **B3b (绝对 ≥ 0) 反例**: 3 个 (UVXY 2 = S2 no_fill_timeout 驱动 ret +26.21%/+21.68%; SOXL 1 = profit_protect 驱动 ret +0.74%)
+- **B3c (≥ 20%) 反例**: 2 个 (UVXY, S2 no_fill_timeout)
+- **关键 nuance**: UVXY 的 S2 反例 ret +26.21% 仍 < baseline +82.81% (-56pp), 即"战术化让你少赚 56pp"
+
+### 结论
+**严证伪 (按原 B3a) 扩展到 5 标的仍通过**. 战术化 4-action 在 UVXY 上的 S2 (no_fill_timeout) 能真触发 + 短 session + 绝对盈利, 但跑输 baseline. 不改 P9 决策 (TURBO 默认 OFF).
+
+### 测试状态
+252/252 全绿 (与会话 2 终态一致, 本次未改业务代码).

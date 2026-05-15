@@ -18,8 +18,20 @@ except ImportError:
     print("pip install yfinance"); sys.exit(1)
 
 CANDIDATES = [
+    # 现有 15 (V1 baseline)
     "UVXY", "VXX", "SVXY", "TQQQ", "SQQQ", "SOXL", "SOXS",
     "SPXL", "SPXS", "TLT", "GLD", "USO", "UNG", "QQQ", "SPY",
+    # VIX 补 (1)
+    "VIXY",
+    # 杠杆 ETF (10)
+    "UPRO", "SPXU", "TNA", "TZA", "FAS", "FAZ", "DRN", "DRV", "NUGT", "DUST",
+    # 高波动单股 (15)
+    "TSLA", "NVDA", "AMD", "PLTR", "COIN", "MSTR", "MARA", "RIOT",
+    "RIVN", "LCID", "AFRM", "SOFI", "DKNG", "HOOD", "GME",
+    # Option income ETF (8)
+    "JEPI", "JEPQ", "QYLD", "XYLD", "RYLD", "TLTW", "HEQT", "SVOL",
+    # 商品/矿业 (1)
+    "GDX",
 ]
 
 GRID_SPACING_ATR = 0.5      # 网格 -1 档距中轴 0.5×ATR

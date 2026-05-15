@@ -207,3 +207,45 @@ UVXY 真实 edge 是"长 hold + ADX>22 时 grid_engine 高位 EXIT", 战术化�
 - CLAUDE.md 未改 (用户明确要求)
 - 不证明"战术化在更长周期 / 别的资产类 / 更大资金量上也不能落地" — Part 1B 给出概念性必要条件可推广, 但实测仅覆盖 4h × UVXY/VXX
 - code quality reviewer P1 阶段提出的另外 3 个 Important issue (config.py L209 stale comment / entry_filter.py getattr fallback `-1.0` vs config `-0.5` / T1+S3 缺单测) 未修, defer 到 followup
+
+---
+
+## F8. 战术化扩展筛选 + Top-3 sweep (2026-05-15 会话 3)
+
+把 Part 1B 4 条必要条件筛选从 15 标的扩到 **50** (含杠杆 ETF / 高波动单股 / option income ETF / VIX), 拉 Alpaca 5y 数据 + Top-3 完整 sweep.
+
+完整证据: [`reports/tactical_extended_screening.md`](./reports/tactical_extended_screening.md).
+
+**50 候选 → 5 个 Part 1B 全过 (10% 通过率)**:
+- UVXY (已被 F7 严证伪)
+- RIOT (BTC mining), MARA (BTC mining): 新发现
+- SOXL (3× 半导体多头), SOXS (3× 半导体反向): 新发现
+
+**6 标的 baseline 对比 (TURBO=ON vs OFF, $10k cap, 5y)**:
+
+| 标的 | TURBO=OFF | TURBO=ON | gap_pp | on_b1 | on_avg_bars |
+|---|---|---|---|---|---|
+| VXX | +226.79% | +165.41% | -61.37 | 0 | 55.5 |
+| UVXY | +82.81% | +73.81% | -8.99 | 0 | 58.4 |
+| RIOT | -20.37% | -20.18% | +0.19 | 0 | 21.0 |
+| SOXL | -22.06% | -20.19% | +1.87 | 0 | 25.4 |
+| MARA | -22.27% | +4.35% | +26.62 | 0 | 96.6 |
+| SOXS | -23.44% | -20.06% | +3.37 | 0 | 55.5 |
+
+**所有标的 `on_b1 = 0`** — 战术 4-action 默认配置下 100% 未触发. RIOT/SOXL/MARA/SOXS gap 正向, 但来自 entry filter ADX_slope (config 而非 tactical) 增益.
+
+**Top-3 完整 sweep (MARA / SOXL / RIOT, ~390 trial) + 上轮 (UVXY/VXX, 251 trial) = 累计 641 trial**:
+
+| B3 阈值 | 累计反例 (5 标的) | 说明 |
+|---|---|---|
+| **B3a (≥ baseline)** | **12** | UVXY/VXX 0, MARA 6 / SOXL 5 / RIOT 1; 全部在负 baseline 标的上, 绝对 ret ≤ +0.74%. 反例本质 = "战术化让大亏变小亏" |
+| **B3b (绝对 ≥ 0)** | **3** | UVXY 2 (S2 no_fill_timeout 驱动, ret +26.21% / +21.68%), SOXL 1 (profit_protect, ret +0.74%) |
+| **B3c (≥ 20% 5y, ~ 无风险)** | **2** | 与 B3b 前两个 UVXY 一致 |
+
+**关键 nuance**: UVXY 上 `SESSION_NO_FILL_TIMEOUT_BARS=12` 单维 trial **真实触发** 16 个 forced_exit, 平均 session 寿命 16.2 bars (满足 B2), 5y 绝对盈利 +26.21% (满足 B3b/B3c). 但 **仍 < TURBO=OFF baseline +82.81% (-56pp gap)**. 即"战术化让你少赚 56pp", 整体仍是负贡献.
+
+**严证伪结论 (按原 B3a)**: ✅ **通过**. 任何 sweep 配置都不能让战术化"超过不开战术化"的回报.
+
+**Nuance (按 B3b/B3c)**: 战术化 S2 (零成交超时退出) 在 UVXY 上"能工作 + 真短线 + 绝对盈利", 但跑输 baseline. 这不构成 plan §2 命题 B 的反例.
+
+**结论保持**: `config.TURBO_ENABLED` 默认 OFF (P9), EXPERIMENTAL banner (P9), 中性 regression test (P9) 都仍是正确决策.
