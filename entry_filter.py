@@ -280,9 +280,9 @@ class EntryFilter:
 
         return passed
 
-    def _check_earnings_blackout(self, current_date: Optional[date] = None) -> tuple[bool, str]:
+    def _check_earnings_blackout(self, current_date: date) -> tuple[bool, str]:
         """检查是否在财报冻结期"""
-        today = current_date or date.today()
+        today = current_date
         for earnings_str in config.EARNINGS_DATES:
             try:
                 ed = date.fromisoformat(earnings_str)
