@@ -69,6 +69,29 @@ def setUpModule():
     config.TOTAL_CAPITAL = 10000.0
 
 
+def _patch_tactical_on(test_case):
+    """让单个 test case 在 TURBO=ON 模式下运行.
+
+    P9 (5237573) 把 config.TURBO_ENABLED 默认改为 OFF (严证伪通过结果).
+    12 个 tactical 行为测试假设 TURBO=ON, 用这个 helper 在 setUp 第一行调
+    一次即可强制开启 tactical_config.TACTICAL_GRID_ENABLED,
+    addCleanup 在 tearDown 阶段自动恢复原值.
+
+    用法:
+        def setUp(self):
+            _patch_tactical_on(self)
+            ...  # 原有 setUp 代码
+    """
+    import tactical_config as _tcfg
+    import config as _cfg
+    orig_tcfg = _tcfg.TACTICAL_GRID_ENABLED
+    orig_cfg = _cfg.TURBO_ENABLED
+    _tcfg.TACTICAL_GRID_ENABLED = True
+    _cfg.TURBO_ENABLED = True
+    test_case.addCleanup(setattr, _tcfg, "TACTICAL_GRID_ENABLED", orig_tcfg)
+    test_case.addCleanup(setattr, _cfg, "TURBO_ENABLED", orig_cfg)
+
+
 class TestStateMachine(unittest.TestCase):
     def setUp(self):
         self.sm = StateMachine()
@@ -2133,6 +2156,9 @@ class TestSignalFilters(unittest.TestCase):
 class TestRecenterDisabledScenarios(unittest.TestCase):
     """should_disable_recenter 三个独立分支."""
 
+    def setUp(self):
+        _patch_tactical_on(self)  # P9 fixup: 这些 test 假设 TURBO=ON
+
     def _view(self, mode=tcfg.SESSION_MODE_OFFENSIVE):
         return trules.SessionStateView(
             session_id="s1", started_at=datetime.now().isoformat(),
@@ -2188,6 +2214,7 @@ class TestGridBotRecenterRespect(unittest.TestCase):
     的网格, 调 _apply_dynamic_adjustment, 验证 recenter 没被执行."""
 
     def setUp(self):
+        _patch_tactical_on(self)  # P9 fixup: 这些 test 假设 TURBO=ON
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
 
@@ -2302,6 +2329,7 @@ class TestTacticalExitOverride(unittest.TestCase):
     """
 
     def setUp(self):
+        _patch_tactical_on(self)  # P9 fixup: 这些 test 假设 TURBO=ON
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
 
@@ -2833,7 +2861,7 @@ class TestGridBotDefensiveBlocksBuy(unittest.TestCase):
     """端到端: bot 在 DEFENSIVE 模式下不应放出 BUY 单 (战术过滤生效)."""
 
     def setUp(self):
-        # 启用战术 (默认开启)
+        _patch_tactical_on(self)  # P9 fixup: 这些 test 假设 TURBO=ON
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
         self.db_path = self.tmp.name
@@ -2936,6 +2964,7 @@ class TestGridBotDefensiveBlocksBuy(unittest.TestCase):
 
 class TestSoftStopTriggersDefensive(unittest.TestCase):
     def setUp(self):
+        _patch_tactical_on(self)  # P9 fixup: 这些 test 假设 TURBO=ON
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
         self.db_path = self.tmp.name
@@ -3013,6 +3042,7 @@ class TestSoftStopTriggersDefensive(unittest.TestCase):
 
 class TestHardStopTriggersExit(unittest.TestCase):
     def setUp(self):
+        _patch_tactical_on(self)  # P9 fixup: 这些 test 假设 TURBO=ON
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
         self.db_path = self.tmp.name
