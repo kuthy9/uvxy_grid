@@ -83,7 +83,7 @@ class EntryFilter:
         self.last_evaluation: Optional[EntryEvaluation] = None
 
     def evaluate(self, hourly_df: pd.DataFrame,
-                 evaluation_time: Optional[datetime] = None) -> EntryEvaluation:
+                 evaluation_time: datetime) -> EntryEvaluation:
         """
         基于当前策略周期K线数据评估当前是否适合入场
         
@@ -95,7 +95,7 @@ class EntryFilter:
         """
         if len(hourly_df) < 50:
             eval_result = EntryEvaluation(
-                timestamp=evaluation_time or datetime.now(),
+                timestamp=evaluation_time,
                 current_price=0.0,
                 rejection_reasons=["数据不足 (需要至少50条策略周期K线)"]
             )
@@ -114,14 +114,14 @@ class EntryFilter:
         return self.evaluate_precomputed(df, evaluation_time=evaluation_time)
 
     def evaluate_precomputed(self, df: pd.DataFrame,
-                             evaluation_time: Optional[datetime] = None) -> EntryEvaluation:
+                             evaluation_time: datetime) -> EntryEvaluation:
         """
         基于已计算好指标的DataFrame评估当前是否适合入场。
         要求最新一行已经包含 EMA/ATR/ADX/BB 等字段。
         """
         if len(df) < 50:
             eval_result = EntryEvaluation(
-                timestamp=evaluation_time or datetime.now(),
+                timestamp=evaluation_time,
                 current_price=0.0,
                 rejection_reasons=["数据不足 (需要至少50条策略周期K线)"]
             )
@@ -133,7 +133,7 @@ class EntryFilter:
         current_price = float(latest["Close"])
 
         eval_result = EntryEvaluation(
-            timestamp=evaluation_time or datetime.now(),
+            timestamp=evaluation_time,
             current_price=current_price,
             adx_value=float(latest["ADX"]),
             atr_pct=float(latest["ATR_PCT"]),
@@ -170,7 +170,7 @@ class EntryFilter:
     # ──────────────────────────────
 
     def _check_conditions(self, ev: EntryEvaluation, df: pd.DataFrame,
-                          evaluation_time: Optional[datetime] = None) -> bool:
+                          evaluation_time: datetime) -> bool:
         """检查整体市场条件是否适合开网格"""
         passed = True
 
@@ -185,6 +185,24 @@ class EntryFilter:
                 f"ADX={ev.adx_value:.1f} 低于下限 {config.ENTRY_MIN_ADX} (无波动)"
             )
             passed = False
+
+        # T1: ADX 斜率 > 阈值 → 拒绝. 防止入场在 ADX 上升早期 (即将 break-out).
+        # ADX_slope > 0 意味着趋势在加强, 即使当前值低于 ENTRY_MAX_ADX 也是
+        # "ranging 即将结束". 把这种 entry 拦掉能减少 BUY-only 单边下跌 session.
+        lookback_adx = max(2, int(getattr(config, "ENTRY_ADX_SLOPE_LOOKBACK_BARS", 3)))
+        max_slope = float(getattr(config, "ENTRY_MAX_ADX_SLOPE", -1.0))
+        if max_slope >= -100 and "ADX" in df.columns and len(df) >= lookback_adx + 1:
+            recent_adx = df["ADX"].tail(lookback_adx + 1)
+            # 简单斜率: (今 - lookback 前) / lookback
+            adx_slope = float(
+                (recent_adx.iloc[-1] - recent_adx.iloc[0]) / lookback_adx
+            )
+            if adx_slope > max_slope:
+                ev.rejection_reasons.append(
+                    f"ADX 斜率={adx_slope:+.2f}/bar (近{lookback_adx}bar) "
+                    f"> 阈值 {max_slope:+.2f} (趋势正在加强, 跳过入场)"
+                )
+                passed = False
 
         # 2. 波动率范围
         if ev.atr_pct < config.ENTRY_MIN_ATR_PCT:
@@ -208,6 +226,25 @@ class EntryFilter:
             )
             passed = False
 
+        # S3: 实际震荡幅度过滤 — 过去 N bar 的 (max High - min Low) / ATR 必须 ≥ 阈值.
+        # ADX 是预测性指标 (有 lag, 经常在临界点选中正在 break 的 chop);
+        # 用实际历史震荡幅度反过来要求"过去一段时间确实在 ranging"再考虑入场.
+        # 设 ENTRY_MIN_RECENT_RANGE_ATR <= 0 关闭该 check.
+        # 这里 suggested_atr 还没算 (_compute_grid_params 在后面跑), 用 atr_pct × price 推算.
+        lookback = max(1, int(getattr(config, "ENTRY_RECENT_RANGE_LOOKBACK_BARS", 20)))
+        min_ratio = float(getattr(config, "ENTRY_MIN_RECENT_RANGE_ATR", 0.0))
+        atr_abs = ev.atr_pct * ev.current_price if ev.current_price > 0 else 0.0
+        if min_ratio > 0 and atr_abs > 0 and len(df) >= lookback:
+            recent = df.tail(lookback)
+            recent_range = float(recent["High"].max() - recent["Low"].min())
+            range_in_atr = recent_range / atr_abs
+            if range_in_atr < min_ratio:
+                ev.rejection_reasons.append(
+                    f"近{lookback}bar震荡幅度={range_in_atr:.2f}×ATR "
+                    f"低于下限 {min_ratio:.1f}×ATR (不在 ranging)"
+                )
+                passed = False
+
         # 3.5. 价格不能离EMA过远，否则只适合继续观察，不适合准备建仓
         if abs(ev.ema_distance_atr) > config.ENTRY_MAX_EMA_DEVIATION_ATR:
             ev.rejection_reasons.append(
@@ -218,7 +255,7 @@ class EntryFilter:
 
         # 4. 财报窗口
         in_blackout, blackout_msg = self._check_earnings_blackout(
-            current_date=(evaluation_time.date() if evaluation_time else None)
+            current_date=evaluation_time.date()
         )
         if in_blackout:
             ev.rejection_reasons.append(blackout_msg)
