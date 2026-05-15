@@ -68,7 +68,7 @@ def _build_sub_bot(symbol: str, df: pd.DataFrame, capital: float,
     executor = SimulatedExecutor(df, capital, clock)
     db = _bt.TradeEventCollector(db_path, clock)
     pnl = PnLTracker(db_path, clock=clock)
-    risk = RiskManager(db, clock=clock)
+    risk = RiskManager(db, clock=clock, allocated_capital=capital)
     state_machine = StateMachine(clock=clock)
     entry_filter = EntryFilter()
     data_fetcher = _bt.HistoricalDataFetcher(df, clock)
@@ -76,7 +76,7 @@ def _build_sub_bot(symbol: str, df: pd.DataFrame, capital: float,
     bot = GridBot(
         clock=clock, executor=executor, db=db, pnl=pnl, risk=risk,
         state_machine=state_machine, entry_filter=entry_filter,
-        data_fetcher=data_fetcher,
+        data_fetcher=data_fetcher, allocated_capital=capital,
     )
     return {
         "symbol": symbol, "df": df, "capital": capital,
