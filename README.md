@@ -63,7 +63,8 @@
 
 ### 3.2 状态机 + 启动恢复
 
-四状态 FSM (`SCANNING → WAITING_ENTRY → ACTIVE_GRID → EXIT_PENDING`) + SQLite / JSON 持久化。
+六状态 FSM (`SCANNING → WAITING_ENTRY → OFFENSIVE_GRID → DEFENSIVE_GRID → EXIT_PENDING → COOLDOWN`)
++ SQLite / JSON 持久化。旧 `ACTIVE_GRID` 在 DB 恢复时被翻译为 `OFFENSIVE_GRID`。
 
 启动恢复链路：
 
@@ -153,10 +154,17 @@ docker compose up -d
 - **回测样本**：UVXY 5 年 4h CSV
 - **支持的策略周期**：`15m` / `1h` / `4h` / `1d` (改 `config.STRATEGY_INTERVAL` 即可，
   系统其他模块全部跟随)
-- **典型 5y 回测指标 (4h V49 真实化撮合)**：总收益 +103%，年化 +15%，
-  Sharpe +0.55，MDD ~9%，胜率 ~84%，walk-forward valid Sharpe ~1.0
-  *(指标定义和具体数字见 PROJECT_STATUS.md §2)*
-- **测试覆盖**：15 个 TestCase 类 / 77 个 `test_*` 用例
+- **当前 5y 回测指标 (4h UVXY, $2000 capital, 真实化撮合)**:
+  - **V49 baseline** (HEAD initial commit `4fdb801` 代码, 通过 git worktree 直接重跑):
+    ret **+109.91%** / annu **+15.01%** / Sharpe +0.54 / MDD 8.88% / 胜率 84.6% /
+    24 sessions
+  - **TURBO=ON, 当前 file defaults (含 T1 ADX_slope 增强)**:
+    ret +53.67% / annu +8.98% / Sharpe +0.20 / MDD 13.32% / 胜率 68.6% / 30 sessions
+  - **TURBO=OFF, legacy fallback** (post bugfix):
+    ret +49.05% / annu +8.32% / Sharpe +0.16 / MDD 19.91% / 胜率 67.9% / 33 sessions
+  - 详细对比 + 战术增强实测明细: `reports/tuning/TACTICAL_REDESIGN_FINAL.md`
+- **测试覆盖**：248 个 `test_*` 用例 (包含 3 个 rate-limit double-consume bug 的
+  回归测试)
 
 ---
 
