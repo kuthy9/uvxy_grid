@@ -150,21 +150,18 @@ docker compose up -d
 > 数值会随研究推进变化；权威来源是 [`PROJECT_STATUS.md`](./PROJECT_STATUS.md) 与
 > `runtime/experiments/` 下的产物。
 
-- **当前默认基线**：`UVXY` × `4h` × `config.py` 中的当前参数版本
-- **回测样本**：UVXY 5 年 4h CSV
+- **当前默认基线**：`UVXY` × `4h` × `TURBO=OFF` (战术化默认 OFF, 见下方说明)
+- **回测样本**：UVXY 5 年 4h CSV ($10k capital, 真实化撮合); VXX ~5 年 4h CSV (2021-05-17 → 2026-05-14)
 - **支持的策略周期**：`15m` / `1h` / `4h` / `1d` (改 `config.STRATEGY_INTERVAL` 即可，
   系统其他模块全部跟随)
-- **当前 5y 回测指标 (4h UVXY, $2000 capital, 真实化撮合)**:
-  - **V49 baseline** (HEAD initial commit `4fdb801` 代码, 通过 git worktree 直接重跑):
-    ret **+109.91%** / annu **+15.01%** / Sharpe +0.54 / MDD 8.88% / 胜率 84.6% /
-    24 sessions
-  - **TURBO=ON, 当前 file defaults (含 T1 ADX_slope 增强)**:
-    ret +53.67% / annu +8.98% / Sharpe +0.20 / MDD 13.32% / 胜率 68.6% / 30 sessions
-  - **TURBO=OFF, legacy fallback** (post bugfix):
-    ret +49.05% / annu +8.32% / Sharpe +0.16 / MDD 19.91% / 胜率 67.9% / 33 sessions
-  - 详细对比 + 战术增强实测明细: `reports/tuning/TACTICAL_REDESIGN_FINAL.md`
-- **测试覆盖**：248 个 `test_*` 用例 (包含 3 个 rate-limit double-consume bug 的
-  回归测试)
+- **当前 5y 回测指标 (4h, $10000 capital, 真实化撮合)**:
+  - **UVXY TURBO=OFF**: ret **+82.81%** / annu +12.05% / Sharpe +0.32 / MDD 15.86%
+  - **UVXY TURBO=ON** (战术化默认参数): ret +73.81% (战术 4 个 action 默认 0 触发, 实质走相似 legacy 路径)
+  - **VXX TURBO=OFF**: ret **+226.79%** / annu +26.78% / Sharpe +0.32 / MDD 15.17%
+  - **VXX TURBO=ON**: ret +165.41% (同上, 战术 4 个 action 默认 0 触发)
+- **战术化不可落地性证明** (2026-05-15): **严证伪通过**. UVXY + VXX × 4h × ≤5y × $10k cap × **251 个 sweep trial 中 0 个满足 B 三条** (Defensive/Forced/Profit-protect 触发 > 0 + 平均 session 寿命 ≤ 20 bars + 5y 回报 ≥ TURBO=OFF baseline). 战术化"短线收割"在合规边界内不能落地. `config.TURBO_ENABLED` 默认 OFF. 完整证据: [`reports/tactical_proof_of_impossibility.md`](./reports/tactical_proof_of_impossibility.md).
+- **历史参考**: V49 worktree (`4fdb801` initial commit, $2k cap) 上的 5y +109.91% / Sharpe +0.54 / MDD 8.88% 是仓库历史 baseline, 与当前 HEAD 之间存在 -29pp legacy 回归 (与战术化命题正交, 未 git-bisect 定位).
+- **测试覆盖**：252 个 `test_*` 用例 (含 4 个 `TestTacticalActionsReachable` 中性 regression 锁战术化 4-action 代码可达性 + 12 个 P9 fixup 显式 TURBO=ON patch)
 
 ---
 

@@ -1,0 +1,78 @@
+# progress — 调查会话日志
+
+## 2026-05-14 会话 1
+**目标**: 完成 A–I 9 项调查.
+
+### 已完成
+- 创建 task_plan.md / findings.md / progress.md
+- 通读: tactical_config.py, tactical_rules.py, session_manager.py, bot_factory.py,
+  orchestrator.py, config.py, README.md, PROJECT_STATUS.md
+- 派 Explore agent 调研 grid_bot.py / state_machine.py / risk_manager.py /
+  entry_filter.py / backtest.py / simulated_executor.py / scripts/tune_tactical.py / test.py
+  → 拿到 8 处战术化分支落点 + 6 状态 FSM 实证 + entry_filter datetime.now() 违规位置
+- 跑 test.py: **248/248 全过** (回归基线 OK)
+- 跑回测矩阵:
+  - UVXY 4h TURBO=ON: +70.89% / Sharpe 0.271 / MDD 13.44%
+  - UVXY 4h TURBO=OFF: +80.16% / Sharpe 0.306 / MDD 16.08% (**比 ON 高 9.27pp**)
+  - UVXY 4h TURBO=OFF + ADX_slope OFF: +65.69% (ADX_slope=-0.5 给 +14.47pp, 是唯一被实证正向的"战术增强")
+  - UVXY 4h TURBO=ON + ADX_slope OFF: +60.97%
+  - UVXY 1h TURBO=ON: **-20.48%** / Sharpe -0.557 / MDD 45.73%
+  - UVXY 1d TURBO=ON: 0 笔
+  - QQQ 4h TURBO=ON/OFF: 0 笔 (入场过滤永远拒绝, UVXY-tuned 参数不通用)
+  - TQQQ 4h TURBO=ON: +45.38%, TURBO=OFF: +48.40% (战术化吃 -3pp)
+
+### 关键发现 (写入 findings.md)
+- F1: 战术化阈值已系统性中性化 (999/99999/1.0/0.0), Defensive=0/Forced=0/Profit-protect=0
+- F2: 战术化在所有跑得动的样本上都是净负贡献
+- F3: QQQ/TQQQ 与 README §2 "弱趋势"目标市场结构矛盾, 不应作为多标的候选
+- F4: CLAUDE.md / README 与代码漂移 (4 vs 6 状态, README §5 数据过时)
+- F5: entry_filter.py 3 处 datetime.now() fallback 违反 CLAUDE.md §9
+- F6: 测试覆盖盲区 — 战术化用例全是单元级, 没有"功能存活" assertion
+
+### 综合根因 (写入 findings.md G)
+- 轴1: 战术化"激进"路径全部失活, 吃 -9pp (设计假设 vs UVXY 真实 edge 不匹配)
+- 轴2: 战术化期间 legacy 路径被改动, 额外吃 -29pp (未 git-bisect 到具体 commit)
+
+### 已用证据回答 A–I
+所有问题都已经在 findings.md 中有明确证据指向. 见最终汇总.
+
+### 未做的事 (明确说明而不是含糊)
+- 没有 git-bisect 定位"-29pp"的具体 commit, 因为:
+  (a) 本会话目标是诊断, 不是修复
+  (b) 战术化本身的 -9pp 是设计问题, bisect 救不回来
+  (c) 需要用户确认是否值得投入这条路径 (vs 直接回退到 V49 + 渐进引入新 feature)
+- 没有改任何业务代码 — 用户问的是诊断与可行性, 不是修复任务.
+
+---
+
+## 2026-05-15 会话 2 — 严证伪 implementation 完成
+
+**Implementation Plan**: `docs/superpowers/plans/2026-05-15-tactical-impossibility-proof.md`
+**Design Spec**: `docs/superpowers/specs/2026-05-14-tactical-impossibility-proof-design.md`
+
+### Commits (按顺序)
+| Task | Commit | 说明 |
+|---|---|---|
+| P1 | 67d9edf | F5 fix: entry_filter 移除 datetime.now() fallback |
+| P1 fixup | 36fbae6 | _check_earnings_blackout 同类 date.today() fallback |
+| P2 | b34998b | BACKTEST_DEFAULT_CAPITAL 2000 → 10000 |
+| P3 | 940c1e7 | README §3.2 4 状态 → 6 状态 |
+| P4 | c261dcc | data/vxx.py + vxx_4h.csv (Alpaca, 3066 bars, ~5y) |
+| P5 | cf5af6f | scripts/_proof_runner.py + smoke test |
+| P6 | c65532c | scripts/prove_tactical.py + UVXY/VXX single_dim sweep (50×2 trial) |
+| P7 | 02daa48 | joint + cost sweep (81 UVXY + 54 VXX + 8×2 cost trial) |
+| P8 | 93d6634 | reports/tactical_proof_of_impossibility.md 完整证明报告 |
+| P9 | 5237573 | TURBO_ENABLED 默认 OFF + tactical_config EXPERIMENTAL banner + 4 中性 regression test |
+| P9 fixup | ef22764 | 12 affected test 加 _patch_tactical_on 显式 TURBO=ON |
+| P10 | (本次) | README §5 + findings F7 + progress 收尾 |
+
+### 严证伪结论
+**通过**. 详见 findings.md F7 + reports/tactical_proof_of_impossibility.md.
+
+### 测试状态
+252/252 全绿 (4 个新 TestTacticalActionsReachable 中性 regression + 12 个 P9 affected test 显式 patch TURBO=ON).
+
+### 未做的事 (诚实声明)
+1. Code quality review P1 阶段 3 个 Important issue 未修 (config.py L209 stale "默认改 -1000" comment / entry_filter.py getattr fallback `-1.0` vs config `-0.5` / T1+S3 入场过滤缺单测) — 这些是上轮战术化遗留, 不在本轮 spec 范围.
+2. CLAUDE.md §1 "4 状态 FSM" 描述过时未改 (用户明确要求).
+3. V49 -29pp 回归未 git-bisect (独立 issue, 与本命题正交).
