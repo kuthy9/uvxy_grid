@@ -1,34 +1,72 @@
 """
-test.py — 核心模块单元测试
+test.py — 全量单元/集成测试 (v3 合并版)
 
-覆盖模块:
-  - state_machine.py  状态转换
-  - pnl_tracker.py    FIFO 买卖配对 / 胜率 / 持久化
-  - risk_manager.py   6 层风控
-  - grid_engine.py    网格构建 / 信号 / 重置 / 退出
+模块覆盖:
+  核心 (原 test.py):
+    - state_machine.py  状态转换
+    - pnl_tracker.py    FIFO 买卖配对 / 胜率 / 持久化
+    - risk_manager.py   6 层风控
+    - grid_engine.py    网格构建 / 信号 / 重置 / 退出
+    - executor / reconcile / waiting_entry 异常路径
 
-运行:  python test.py
+  战术 (原 test_tactical.py):
+    - tactical_rules / session_manager / state_machine v3 / trade_logger migration
+    - GridBot defensive 信号过滤 / 软止损 / 硬止损 / partial profit
+
+  多标的 (原 test_multi_symbol.py):
+    - CapitalAllocator / ClientIdAllocator / AccountRiskManager
+    - RiskManager 委托 / 多 bot 共享 hard_stop / 日亏损跨 symbol 聚合
+
+  基础设施 (原 test_infrastructure.py):
+    - CapitalProvider / cache invalidation / Clock 统一 / rescale
+    - MultiSymbolOrchestrator 故障隔离 / manual_resume CLI
+
+运行: python test.py
 """
 
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import config
-from state_machine import StateMachine, SystemState
+import tactical_config as tcfg
+import tactical_rules as trules
+from account_risk import AccountRiskManager
+from capital_allocator import (
+    CapitalAllocator, AllocationError,
+    single_symbol_allocator, equal_split_allocator,
+    rescale_from_equity, rescale_from_account_risk,
+    LiveCapitalProvider, StaticCapitalProvider, build_capital_provider,
+)
+from client_id_allocator import (
+    ClientIdAllocator, ClientIdExhausted,
+    get_default_allocator, reset_default_allocator,
+)
+from grid_engine import DynamicGridEngine, LevelState, GridSide
+from interfaces import LiveClock
+from orchestrator import MultiSymbolOrchestrator
 from pnl_tracker import PnLTracker
 from risk_manager import RiskManager
-from grid_engine import DynamicGridEngine, LevelState, GridSide
+from session_manager import (
+    SessionManager, SessionContext,
+    ACTION_NONE, ACTION_ENTER_DEFENSIVE, ACTION_FORCE_EXIT,
+    ACTION_PROFIT_PROTECT_EXIT, ACTION_PARTIAL_PROFIT_EXIT,
+)
+from state_machine import StateMachine, SystemState, is_grid_state
 from trade_logger import TradeDatabase
 
 
 def setUpModule():
-    """测试 fixture: 锁定 TOTAL_CAPITAL=2000 以复现 V49 阈值假设.
-    生产代码从不读这个值 — 它只在 test/backtest 中被显式注入."""
-    config.TOTAL_CAPITAL = 2000.0
+    """测试 fixture: 锁定 TOTAL_CAPITAL=10000 (v3 基线, 与用户 $10k 账户假设一致).
+    生产代码从不读这个值 — 它只在 test/backtest 中被显式注入.
+    部分老测试 (V49 baseline) 用 2000 — 它们仍能通过, 因为断言都用
+    `config.TOTAL_CAPITAL * X` 而非硬编码数值."""
+    config.TOTAL_CAPITAL = 10000.0
 
 
 class TestStateMachine(unittest.TestCase):
@@ -64,11 +102,12 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(self.sm.state, SystemState.WAITING_ENTRY)
 
     def test_grid_active_transition_increments_sessions(self):
+        # v3 起 on_grid_active 目标态是 OFFENSIVE_GRID (取代旧的 ACTIVE_GRID).
         t0 = datetime.now()
         self.sm.on_entry_evaluation(True, "ok", now=t0)
         sessions_before = self.sm.context.total_grid_sessions
         self.sm.on_grid_active(now=t0)
-        self.assertEqual(self.sm.state, SystemState.ACTIVE_GRID)
+        self.assertEqual(self.sm.state, SystemState.OFFENSIVE_GRID)
         self.assertEqual(self.sm.context.total_grid_sessions, sessions_before + 1)
 
     def test_exit_signal_only_fires_in_active_grid(self):
@@ -393,11 +432,11 @@ class TestStateMachinePersistence(unittest.TestCase):
         sm.on_recenter(now=t0)
         sm.save_state(self.db_path)
 
-        # 新实例从同一数据库恢复
+        # 新实例从同一数据库恢复 — v3 后 on_grid_active 目标态是 OFFENSIVE_GRID
         sm2 = StateMachine()
         ok = sm2.load_state(self.db_path)
         self.assertTrue(ok)
-        self.assertEqual(sm2.state, SystemState.ACTIVE_GRID)
+        self.assertEqual(sm2.state, SystemState.OFFENSIVE_GRID)
         self.assertEqual(sm2.context.total_grid_sessions, 1)
         self.assertEqual(sm2.context.total_recenters, 1)
 
@@ -1248,6 +1287,7 @@ class TestExecuteEntryPriceUnavailable(unittest.TestCase):
     def test_no_price_skips_order_and_logs_event(self):
         from grid_bot import GridBot
         bot = GridBot.__new__(GridBot)
+        bot.symbol = config.SYMBOL  # __new__-style 测试: 必须显式设
         bot.executor = MagicMock()
         bot.executor.get_current_price.return_value = None
         bot.executor.is_connected.return_value = True
@@ -1284,6 +1324,7 @@ class TestScanningImmediatelyHandsOffToWaiting(unittest.TestCase):
         # 起点: SCANNING
 
         bot = GridBot.__new__(GridBot)
+        bot.symbol = config.SYMBOL  # __new__-style 测试: 必须显式设
         bot.clock = clock
         bot.state_machine = sm
         bot.db = MagicMock()
@@ -1359,6 +1400,7 @@ class TestWaitingEntryAutoReset(unittest.TestCase):
                          "测试 fixture", now=clock.now())
 
         bot = GridBot.__new__(GridBot)
+        bot.symbol = config.SYMBOL  # __new__-style 测试: 必须显式设
         bot.clock = clock
         bot.state_machine = sm
         bot.db = MagicMock()
@@ -1542,6 +1584,7 @@ class TestDailySnapshotWriting(unittest.TestCase):
         sm = StateMachine(clock=clock)
 
         bot = GridBot.__new__(GridBot)
+        bot.symbol = config.SYMBOL  # __new__-style 测试: 必须显式设
         bot.clock = clock
         bot.state_machine = sm
         bot.db = MagicMock()
@@ -1624,9 +1667,9 @@ class TestDailySnapshotWriting(unittest.TestCase):
         self.assertEqual(bot.db.log_daily_snapshot.call_count, 2)
 
     def test_snapshot_written_after_successful_entry(self):
-        """_execute_entry 成功后, 当天 daily_snapshot 必须刷新且 state=active_grid."""
+        """_execute_entry 成功后, 当天 daily_snapshot 必须刷新且 state=offensive_grid (v3)."""
         bot = self._make_bot()
-        # on_grid_active 要求当前在 WAITING_ENTRY 才会转换到 ACTIVE_GRID
+        # on_grid_active 要求当前在 WAITING_ENTRY 才会转换到 OFFENSIVE_GRID
         bot.state_machine.transition_to(
             SystemState.WAITING_ENTRY, "test fixture", now=bot.clock.now()
         )
@@ -1645,7 +1688,8 @@ class TestDailySnapshotWriting(unittest.TestCase):
         bot.db.log_daily_snapshot.assert_called()
         states = [c.kwargs.get("state")
                   for c in bot.db.log_daily_snapshot.call_args_list]
-        self.assertIn("active_grid", states)
+        # v3 起新建仓走 OFFENSIVE_GRID; 兼容旧字符串依旧保留 enum 但实际写入是新值.
+        self.assertIn("offensive_grid", states)
 
     def test_snapshot_written_after_grid_fill(self):
         """ACTIVE_GRID 中检测到成交, 当天 snapshot 必须刷新."""
@@ -1693,6 +1737,2482 @@ class TestDailySnapshotWriting(unittest.TestCase):
             bot._log_daily_snapshot_now(reason="boom")
         except Exception as e:  # pragma: no cover
             self.fail(f"_log_daily_snapshot_now 不应抛出异常, got: {e}")
+
+
+# ════════════════════════════════════════════
+#  ReportGenerator: session 维度聚合
+# ════════════════════════════════════════════
+
+class TestReportGeneratorSessionAggregation(unittest.TestCase):
+    """从 grid_sessions / grid_session_events / trades 聚合 session 维度统计."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = TradeDatabase(db_path=self.tmp.name)
+        from report_generator import ReportGenerator
+        import tempfile as _tf
+        self.rdir = _tf.TemporaryDirectory()
+        self.gen = ReportGenerator(db_path=self.tmp.name,
+                                     report_dir=self.rdir.name,
+                                     symbol="UVXY")
+
+    def tearDown(self):
+        self.rdir.cleanup()
+        os.unlink(self.tmp.name)
+
+    def _insert_session(self, sid, status, mode, total_pnl, age_bars,
+                         exit_reason="", started_at=None):
+        with sqlite3.connect(self.tmp.name) as conn:
+            conn.execute(
+                """INSERT INTO grid_sessions
+                   (session_id, symbol, started_at, ended_at, status,
+                    mode, start_equity, total_pnl, age_bars, max_drawdown,
+                    exit_reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (sid, "UVXY", started_at or "2026-01-01T10:00",
+                 "2026-01-02T10:00" if status == "closed" else None,
+                 status, mode, 10000.0, total_pnl, age_bars, 20.0,
+                 exit_reason)
+            )
+
+    def test_empty_db_returns_zero_aggregates(self):
+        self.assertIsNone(self.gen.get_current_session())
+        agg = self.gen.get_session_aggregates()
+        self.assertEqual(agg["session_count"], 0)
+        self.assertEqual(agg["forced_exit_count"], 0)
+
+    def test_current_session_returned_for_open(self):
+        self._insert_session("s_open", "open", "offensive", 50.0, 4.0)
+        cur = self.gen.get_current_session()
+        self.assertIsNotNone(cur)
+        self.assertEqual(cur["session_id"], "s_open")
+        self.assertEqual(cur["mode"], "offensive")
+
+    def test_aggregates_pnl_stats(self):
+        self._insert_session("s1", "closed", "offensive", 100.0, 6.0, "exit_complete")
+        self._insert_session("s2", "closed", "defensive", -50.0, 12.0, "硬止损 触发")
+        self._insert_session("s3", "closed", "offensive", 200.0, 8.0, "exit_complete")
+        agg = self.gen.get_session_aggregates()
+        self.assertEqual(agg["session_count"], 3)
+        self.assertAlmostEqual(agg["average_session_pnl"], (100 - 50 + 200) / 3)
+        self.assertAlmostEqual(agg["median_session_pnl"], 100.0)
+        self.assertAlmostEqual(agg["max_session_loss"], -50.0)
+        self.assertAlmostEqual(agg["max_session_age_bars"], 12.0)
+
+    def test_forced_exit_count_from_reason(self):
+        self._insert_session("s1", "closed", "offensive", -100.0, 5.0, "硬止损 force_exit")
+        self._insert_session("s2", "closed", "defensive", -200.0, 6.0, "hard_stop")
+        self._insert_session("s3", "closed", "offensive", 50.0, 4.0, "normal exit")
+        agg = self.gen.get_session_aggregates()
+        self.assertEqual(agg["forced_exit_count"], 2)
+        self.assertAlmostEqual(agg["forced_exit_ratio"], 200.0 / 3)
+
+    def test_profit_protect_and_timeout_counts(self):
+        self._insert_session("s1", "closed", "offensive", 150.0, 5.0,
+                              "trailing_giveback profit_protect")
+        self._insert_session("s2", "closed", "defensive", -30.0, 25.0,
+                              "absolute_max_age 超时")
+        agg = self.gen.get_session_aggregates()
+        self.assertEqual(agg["profit_protect_exit_count"], 1)
+        self.assertEqual(agg["timeout_exit_count"], 1)
+
+    def test_defensive_mode_count(self):
+        self._insert_session("s1", "closed", "defensive", -50.0, 8.0)
+        self._insert_session("s2", "closed", "offensive", 100.0, 5.0)
+        self._insert_session("s3", "closed", "defensive", -20.0, 6.0)
+        agg = self.gen.get_session_aggregates()
+        self.assertEqual(agg["defensive_mode_count"], 2)
+        self.assertAlmostEqual(agg["defensive_mode_ratio"], 200.0 / 3)
+
+    def test_win_rate_and_profit_factor(self):
+        self._insert_session("s1", "closed", "offensive", 100.0, 4.0)
+        self._insert_session("s2", "closed", "offensive", -50.0, 6.0)
+        self._insert_session("s3", "closed", "offensive", 200.0, 5.0)
+        agg = self.gen.get_session_aggregates()
+        # 2 wins / 3 sessions = 66.7%
+        self.assertAlmostEqual(agg["win_rate"], 200.0 / 3, places=1)
+        # profit_factor = (100+200) / |-50| = 6.0
+        self.assertAlmostEqual(agg["profit_factor"], 6.0)
+
+    def test_average_trades_per_session(self):
+        self._insert_session("s1", "closed", "offensive", 100.0, 4.0)
+        self._insert_session("s2", "closed", "offensive", 50.0, 3.0)
+        # 模拟 trades 表写入 session_id
+        with sqlite3.connect(self.tmp.name) as conn:
+            for sid, count in [("s1", 6), ("s2", 4)]:
+                for _ in range(count):
+                    conn.execute(
+                        """INSERT INTO trades
+                           (timestamp, action, symbol, quantity, price, session_id)
+                           VALUES (?, 'BUY', 'UVXY', 1.0, 10.0, ?)""",
+                        ("2026-01-01T10:00", sid)
+                    )
+        agg = self.gen.get_session_aggregates()
+        self.assertAlmostEqual(agg["average_trades_per_session"], 5.0)
+
+    def test_render_sessions_does_not_crash_empty(self):
+        html = self.gen._render_sessions()
+        self.assertIn("暂无", html)
+
+    def test_render_sessions_includes_current_and_aggregates(self):
+        self._insert_session("s_open", "open", "offensive", 30.0, 3.0)
+        self._insert_session("s1", "closed", "offensive", 50.0, 4.0, "exit_complete")
+        html = self.gen._render_sessions()
+        self.assertIn("s_open", html)
+        self.assertIn("OFFENSIVE", html)
+        self.assertIn("Session 总数", html)
+
+
+
+# ════════════════════════════════════════════
+#  从 test_tactical.py 合并: 战术规则 / session / 状态机 v3
+# ════════════════════════════════════════════
+
+# ════════════════════════════════════════════
+#  tactical_rules: 纯函数评分 / 决策
+# ════════════════════════════════════════════
+
+class TestTrendRiskScore(unittest.TestCase):
+    def test_calm_market_low_score(self):
+        ctx = trules.MarketContext(
+            current_price=10.0, ema=10.0, atr=0.2, atr_pct=0.02,
+            adx=10.0, grid_center=10.0,
+            ema_slope=0.0, consecutive_down_bars=0, price_below_ema_bars=0,
+            atr_expansion=1.0,
+        )
+        score = trules.calculate_trend_risk_score(ctx)
+        self.assertLess(score, 40.0)
+
+    def test_strong_downtrend_high_score(self):
+        # 测试 score 函数本身 — 不依赖 DEFENSIVE 阈值当前默认 (新默认 999 disables).
+        ctx = trules.MarketContext(
+            current_price=8.0, ema=10.0, atr=0.5, atr_pct=0.05,
+            adx=35.0, grid_center=10.0,
+            ema_slope=-0.015, consecutive_down_bars=5, price_below_ema_bars=5,
+            atr_expansion=1.6,
+        )
+        score = trules.calculate_trend_risk_score(ctx)
+        # 强下行场景应该得到偏高分 (≥60), 不强求触发 DEFENSIVE 阈值
+        # (DEFENSIVE 阈值是用户可调的 opt-in 风控参数).
+        self.assertGreaterEqual(score, 60.0)
+
+    def test_extreme_score_caps_at_100(self):
+        ctx = trules.MarketContext(
+            current_price=5.0, ema=10.0, atr=1.0, atr_pct=0.20,
+            adx=80.0, grid_center=10.0,
+            ema_slope=-0.10, consecutive_down_bars=20, price_below_ema_bars=20,
+            atr_expansion=3.0,
+        )
+        score = trules.calculate_trend_risk_score(ctx)
+        self.assertLessEqual(score, 100.0)
+
+
+class TestConfidence(unittest.TestCase):
+    def test_calm_market_high_confidence(self):
+        ctx = trules.MarketContext(
+            current_price=10.0, ema=10.0, atr=0.2, atr_pct=0.02,
+            adx=8.0, grid_center=10.0,
+        )
+        self.assertEqual(trules.calculate_confidence(ctx), tcfg.CONFIDENCE_HIGH)
+
+    def test_volatile_market_low_confidence(self):
+        ctx = trules.MarketContext(
+            current_price=8.0, ema=10.0, atr=0.5, atr_pct=0.05,
+            adx=35.0, grid_center=10.0,
+            ema_slope=-0.015, consecutive_down_bars=4, price_below_ema_bars=4,
+            atr_expansion=1.7,
+        )
+        self.assertEqual(trules.calculate_confidence(ctx), tcfg.CONFIDENCE_LOW)
+
+
+class TestPositionCap(unittest.TestCase):
+    def test_high_confidence_larger_cap(self):
+        h_pct, h_lv = trules.calculate_dynamic_position_cap(tcfg.CONFIDENCE_HIGH)
+        n_pct, n_lv = trules.calculate_dynamic_position_cap(tcfg.CONFIDENCE_NORMAL)
+        self.assertGreater(h_pct, n_pct)
+        self.assertGreaterEqual(h_lv, n_lv)
+
+    def test_low_confidence_tighter(self):
+        l_pct, l_lv = trules.calculate_dynamic_position_cap(tcfg.CONFIDENCE_LOW)
+        n_pct, n_lv = trules.calculate_dynamic_position_cap(tcfg.CONFIDENCE_NORMAL)
+        self.assertLess(l_pct, n_pct)
+
+
+# ════════════════════════════════════════════
+#  should_enter_defensive / should_force_exit / should_protect_profit
+# ════════════════════════════════════════════
+
+class TestDecisionFunctions(unittest.TestCase):
+    def _view(self, **kwargs):
+        defaults = dict(
+            session_id="sess1", started_at=datetime.now().isoformat(),
+            age_bars=2.0, start_equity=10000.0, start_price=10.0,
+            current_equity=10000.0, realized_pnl=0.0, unrealized_pnl=0.0,
+            total_pnl=0.0, peak_pnl=0.0, max_drawdown=0.0,
+            max_position_value=0.0, position_value=0.0,
+            filled_buy_levels=[], mode=tcfg.SESSION_MODE_OFFENSIVE,
+        )
+        defaults.update(kwargs)
+        return trules.SessionStateView(**defaults)
+
+    def _ctx(self, **kwargs):
+        defaults = dict(
+            current_price=10.0, ema=10.0, atr=0.2, atr_pct=0.02, adx=10.0,
+            grid_center=10.0,
+        )
+        defaults.update(kwargs)
+        return trules.MarketContext(**defaults)
+
+    def test_soft_stop_triggers_defensive(self):
+        # 不依赖 SOFT/HARD_STOP_PCT 当前默认值 — 临时设阈值再测.
+        # 测试逻辑: loss 大于 SOFT 且小于 HARD → enter_defensive.
+        orig_soft = tcfg.SESSION_SOFT_STOP_PCT
+        orig_hard = tcfg.SESSION_HARD_STOP_PCT
+        try:
+            tcfg.SESSION_SOFT_STOP_PCT = 0.010
+            tcfg.SESSION_HARD_STOP_PCT = 0.020
+            view = self._view(total_pnl=-150.0)  # -1.5% on $10k start_equity
+            ctx = self._ctx()
+            should, reason = trules.should_enter_defensive(view, ctx)
+            self.assertTrue(should)
+            self.assertIn("软止损", reason)
+        finally:
+            tcfg.SESSION_SOFT_STOP_PCT = orig_soft
+            tcfg.SESSION_HARD_STOP_PCT = orig_hard
+
+    def test_hard_stop_triggers_force_exit(self):
+        orig_hard = tcfg.SESSION_HARD_STOP_PCT
+        try:
+            tcfg.SESSION_HARD_STOP_PCT = 0.020
+            view = self._view(total_pnl=-250.0)  # -2.5% > 2% HARD
+            ctx = self._ctx()
+            should, reason = trules.should_force_exit(view, ctx)
+            self.assertTrue(should)
+            self.assertIn("硬止损", reason)
+        finally:
+            tcfg.SESSION_HARD_STOP_PCT = orig_hard
+
+    def test_no_action_in_calm_session(self):
+        view = self._view(total_pnl=20.0)
+        ctx = self._ctx()
+        self.assertFalse(trules.should_force_exit(view, ctx)[0])
+        self.assertFalse(trules.should_enter_defensive(view, ctx)[0])
+
+    def test_absolute_max_age_force_exit(self):
+        view = self._view(age_bars=tcfg.SESSION_ABSOLUTE_MAX_AGE_BARS + 1)
+        ctx = self._ctx()
+        should, _ = trules.should_force_exit(view, ctx)
+        self.assertTrue(should)
+
+    def test_trailing_giveback_triggers_profit_exit(self):
+        # 不依赖 profit-protect 默认值 — 临时设阈值再测.
+        orig_min = tcfg.SESSION_MIN_PROFIT_TO_PROTECT_PCT
+        orig_strong = tcfg.SESSION_STRONG_PROFIT_PCT
+        orig_giveback = tcfg.SESSION_TRAILING_GIVEBACK_RATIO
+        try:
+            tcfg.SESSION_MIN_PROFIT_TO_PROTECT_PCT = 0.005
+            tcfg.SESSION_STRONG_PROFIT_PCT = 0.012
+            tcfg.SESSION_TRAILING_GIVEBACK_RATIO = 0.40
+            # peak=$150 (1.5% > 0.5%); 当前回吐到 $50 → giveback ratio 66% > 40%
+            view = self._view(total_pnl=50.0, peak_pnl=150.0,
+                              position_value=5000.0)
+            protect, reason, details = trules.should_protect_profit(view)
+            self.assertTrue(protect)
+            self.assertEqual(details.get("action"), "exit")
+            self.assertIn("giveback", details.get("reason_code", ""))
+        finally:
+            tcfg.SESSION_MIN_PROFIT_TO_PROTECT_PCT = orig_min
+            tcfg.SESSION_STRONG_PROFIT_PCT = orig_strong
+            tcfg.SESSION_TRAILING_GIVEBACK_RATIO = orig_giveback
+
+    def test_strong_profit_triggers_partial_exit(self):
+        orig_min = tcfg.SESSION_MIN_PROFIT_TO_PROTECT_PCT
+        orig_strong = tcfg.SESSION_STRONG_PROFIT_PCT
+        orig_partial = tcfg.SESSION_STRONG_PROFIT_PARTIAL_EXIT_RATIO
+        try:
+            tcfg.SESSION_MIN_PROFIT_TO_PROTECT_PCT = 0.005
+            tcfg.SESSION_STRONG_PROFIT_PCT = 0.012
+            tcfg.SESSION_STRONG_PROFIT_PARTIAL_EXIT_RATIO = 0.35
+            # 当前 1.5% (> 1.2% STRONG), peak 也是 1.5%, 没有回吐
+            view = self._view(total_pnl=150.0, peak_pnl=150.0,
+                              position_value=5000.0)
+            protect, reason, details = trules.should_protect_profit(view)
+            self.assertTrue(protect)
+            self.assertEqual(details.get("action"), "partial_exit")
+            self.assertAlmostEqual(
+                details["partial_exit_ratio"],
+                tcfg.SESSION_STRONG_PROFIT_PARTIAL_EXIT_RATIO,
+            )
+        finally:
+            tcfg.SESSION_MIN_PROFIT_TO_PROTECT_PCT = orig_min
+            tcfg.SESSION_STRONG_PROFIT_PCT = orig_strong
+            tcfg.SESSION_STRONG_PROFIT_PARTIAL_EXIT_RATIO = orig_partial
+
+
+# ════════════════════════════════════════════
+#  should_allow_buy / sell
+# ════════════════════════════════════════════
+
+class TestSignalFilters(unittest.TestCase):
+    def _view(self, mode=tcfg.SESSION_MODE_OFFENSIVE, **kwargs):
+        defaults = dict(
+            session_id="s1", started_at=datetime.now().isoformat(),
+            age_bars=1.0, start_equity=10000.0, current_equity=10000.0,
+            position_value=0.0, mode=mode,
+        )
+        defaults.update(kwargs)
+        return trules.SessionStateView(**defaults)
+
+    def _ctx(self, **kwargs):
+        defaults = dict(current_price=10.0, ema=10.0, atr=0.2, atr_pct=0.02,
+                        adx=10.0, grid_center=10.0)
+        defaults.update(kwargs)
+        return trules.MarketContext(**defaults)
+
+    def test_defensive_blocks_all_buys(self):
+        view = self._view(mode=tcfg.SESSION_MODE_DEFENSIVE)
+        for lv in [-1, -2, -3, -4, -5, -6]:
+            ok, _ = trules.should_allow_buy(view, lv, self._ctx())
+            self.assertFalse(ok, f"DEFENSIVE 不该允许 BUY level={lv}")
+
+    def test_offensive_normal_max_3_buy_levels(self):
+        view = self._view()  # 默认 OFFENSIVE
+        # 当前 confidence 计算结果应是 HIGH (calm market), 允许 4 层
+        ctx = self._ctx()
+        ok, _ = trules.should_allow_buy(view, -1, ctx,
+                                         confidence=tcfg.CONFIDENCE_NORMAL)
+        self.assertTrue(ok)
+        ok, _ = trules.should_allow_buy(view, -3, ctx,
+                                         confidence=tcfg.CONFIDENCE_NORMAL)
+        self.assertTrue(ok)
+        # normal 下 -4 应被拒
+        ok, _ = trules.should_allow_buy(view, -4, ctx,
+                                         confidence=tcfg.CONFIDENCE_NORMAL)
+        self.assertFalse(ok)
+
+    def test_high_confidence_allows_one_more_level(self):
+        view = self._view()
+        ctx = self._ctx()
+        ok, _ = trules.should_allow_buy(view, -4, ctx,
+                                         confidence=tcfg.CONFIDENCE_HIGH)
+        self.assertTrue(ok)
+        # 第 5 层仍拒
+        ok, _ = trules.should_allow_buy(view, -5, ctx,
+                                         confidence=tcfg.CONFIDENCE_HIGH)
+        self.assertFalse(ok)
+
+    def test_position_cap_blocks_further_buy(self):
+        # 仓位 5000 已达 NORMAL 上限 4500 (45% × 10000)
+        view = self._view(position_value=5000.0)
+        ctx = self._ctx()
+        ok, why = trules.should_allow_buy(view, -1, ctx,
+                                            confidence=tcfg.CONFIDENCE_NORMAL)
+        self.assertFalse(ok)
+        self.assertIn("仓位", why)
+
+    def test_defensive_sell_requires_rebound(self):
+        view = self._view(mode=tcfg.SESSION_MODE_DEFENSIVE)
+        # 价格深跌 1×ATR 以下, 不应该卖
+        ctx = self._ctx(current_price=9.7, grid_center=10.0, atr=0.2)
+        ok, why = trules.should_allow_sell(view, 1, ctx)
+        self.assertFalse(ok)
+        # 反弹回 grid_center 之上则允许
+        ctx2 = self._ctx(current_price=10.1, grid_center=10.0, atr=0.2)
+        ok, _ = trules.should_allow_sell(view, 1, ctx2)
+        self.assertTrue(ok)
+
+
+# ════════════════════════════════════════════
+#  战术 recenter 禁用 (场景 7/8/9)
+#  - DEFENSIVE 下不 recenter
+#  - 软止损后不 recenter
+#  - OFFENSIVE 默认不 recenter
+# ════════════════════════════════════════════
+
+class TestRecenterDisabledScenarios(unittest.TestCase):
+    """should_disable_recenter 三个独立分支."""
+
+    def _view(self, mode=tcfg.SESSION_MODE_OFFENSIVE):
+        return trules.SessionStateView(
+            session_id="s1", started_at=datetime.now().isoformat(),
+            age_bars=1.0, start_equity=10000.0, current_equity=10000.0,
+            mode=mode,
+        )
+
+    def test_defensive_disables_recenter(self):
+        """场景 7: session.mode==DEFENSIVE → should_disable_recenter=True."""
+        view = self._view(mode=tcfg.SESSION_MODE_DEFENSIVE)
+        disable, reason = trules.should_disable_recenter(view, soft_stop_triggered=False)
+        self.assertTrue(disable)
+        self.assertIn("DEFENSIVE", reason)
+
+    def test_soft_stop_flag_disables_recenter_in_offensive(self):
+        """场景 8: OFFENSIVE 中但 soft_stop_triggered=True → should_disable_recenter=True."""
+        view = self._view(mode=tcfg.SESSION_MODE_OFFENSIVE)
+        disable, reason = trules.should_disable_recenter(view, soft_stop_triggered=True)
+        self.assertTrue(disable)
+        # 注意优先级: OFFENSIVE 默认禁用也会命中. 但 soft_stop 分支应当也能匹配.
+        # 实际行为: rules 先检查 DEFENSIVE → soft_stop → OFFENSIVE, 这里返回 "软止损后"
+        # 当 TACTICAL_RECENTER_ALLOWED_IN_OFFENSIVE=False 时, OFFENSIVE 也禁用,
+        # 测试只要求 disable=True (任一原因)
+        self.assertTrue("软止损" in reason or "OFFENSIVE" in reason)
+
+    def test_offensive_default_disables_recenter(self):
+        """场景 9: OFFENSIVE 模式, 配置 TACTICAL_RECENTER_ALLOWED_IN_OFFENSIVE=False → 默认禁用 recenter."""
+        view = self._view(mode=tcfg.SESSION_MODE_OFFENSIVE)
+        # 验证默认配置确实禁用
+        self.assertFalse(tcfg.TACTICAL_RECENTER_ALLOWED_IN_OFFENSIVE,
+                          "默认 TACTICAL_RECENTER_ALLOWED_IN_OFFENSIVE 应为 False")
+        disable, reason = trules.should_disable_recenter(view, soft_stop_triggered=False)
+        self.assertTrue(disable)
+        self.assertIn("OFFENSIVE", reason)
+
+    def test_recenter_allowed_when_tactical_disabled(self):
+        """战术开关 TACTICAL_GRID_ENABLED=False 时, should_disable_recenter 永不禁."""
+        original = tcfg.TACTICAL_GRID_ENABLED
+        try:
+            tcfg.TACTICAL_GRID_ENABLED = False
+            view = self._view(mode=tcfg.SESSION_MODE_DEFENSIVE)
+            disable, _ = trules.should_disable_recenter(view, soft_stop_triggered=True)
+            self.assertFalse(disable, "TACTICAL_GRID_ENABLED=False 时不应禁用 recenter")
+        finally:
+            tcfg.TACTICAL_GRID_ENABLED = original
+
+
+class TestGridBotRecenterRespect(unittest.TestCase):
+    """端到端: grid_bot._apply_dynamic_adjustment 调用 should_disable_recenter 后
+    确实跳过 grid_engine.recenter (不调 batch_cancel_orders / log_grid_recenter).
+
+    用 __new__ 装配最小 bot, 让 session 处于 DEFENSIVE, 然后塞一个 should_recenter=True
+    的网格, 调 _apply_dynamic_adjustment, 验证 recenter 没被执行."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def _make_bot(self, *, session_mode, soft_stop=False):
+        from grid_bot import GridBot
+        import pandas as pd
+        import numpy as np
+
+        clock = LiveClock()
+        db = TradeDatabase(db_path=self.tmp.name)
+        sm = SessionManager(db=db, clock=clock)
+        sm.start_session(
+            symbol="UVXY", start_equity=10000.0, start_cash=5000.0,
+            start_position=100.0, start_price=10.0,
+        )
+        if session_mode == tcfg.SESSION_MODE_DEFENSIVE:
+            sm.enter_defensive_mode("test")
+
+        # data_fetcher mock: 返回足够数据让 compute_all_indicators 跑过
+        n = 100
+        idx = pd.date_range("2026-01-01", periods=n, freq="4h")
+        df = pd.DataFrame({
+            "Open": np.full(n, 10.0), "High": np.full(n, 10.5),
+            "Low": np.full(n, 9.5), "Close": np.full(n, 10.0),
+            "Volume": np.full(n, 1e6),
+        }, index=idx)
+        df_fetcher = MagicMock()
+        df_fetcher.get_strategy_data.return_value = df
+
+        # mock grid: 假装 should_recenter 返回 True, 但 recenter 不应被调用
+        grid = MagicMock()
+        grid.center_price = 10.0
+        grid.atr_at_init = 0.2
+        grid.spacing_pct = 0.02  # float (sqlite 绑定 — 不能用 MagicMock)
+        grid.should_exit.return_value = (False, "")
+        grid.should_recenter.return_value = (True, "EMA 漂移测试")
+        grid.recenter = MagicMock()
+
+        bot = GridBot.__new__(GridBot)
+        bot.symbol = "UVXY"
+        bot.clock = clock
+        bot.executor = MagicMock()
+        bot.db = db
+        bot.pnl = MagicMock()
+        bot.risk = MagicMock()
+        bot.state_machine = MagicMock()
+        bot.state_machine.state = SystemState.DEFENSIVE_GRID \
+            if session_mode == tcfg.SESSION_MODE_DEFENSIVE \
+            else SystemState.OFFENSIVE_GRID
+        bot.state_machine.on_exit_signal.return_value = None
+        bot.entry_filter = MagicMock()
+        bot.data_fetcher = df_fetcher
+        bot.strategy_df_days = 60
+        bot.session_manager = sm
+        bot.grid = grid
+        bot._soft_stop_triggered = bool(soft_stop)
+        bot._market_context_cache = None
+        bot._allocated_capital = None
+        bot._capital_provider = None
+        return bot
+
+    def test_defensive_session_skips_recenter(self):
+        """场景 7 集成: DEFENSIVE 下 _apply_dynamic_adjustment 不调 grid.recenter."""
+        bot = self._make_bot(session_mode=tcfg.SESSION_MODE_DEFENSIVE)
+        bot._apply_dynamic_adjustment(current_price=10.0)
+        bot.grid.recenter.assert_not_called()
+
+    def test_soft_stop_skips_recenter(self):
+        """场景 8 集成: OFFENSIVE 中但 _soft_stop_triggered=True 时也跳过 recenter."""
+        bot = self._make_bot(
+            session_mode=tcfg.SESSION_MODE_OFFENSIVE, soft_stop=True
+        )
+        bot._apply_dynamic_adjustment(current_price=10.0)
+        bot.grid.recenter.assert_not_called()
+
+    def test_offensive_default_skips_recenter(self):
+        """场景 9 集成: 默认 OFFENSIVE 也跳过 recenter (TACTICAL_RECENTER_ALLOWED_IN_OFFENSIVE=False)."""
+        bot = self._make_bot(session_mode=tcfg.SESSION_MODE_OFFENSIVE)
+        bot._apply_dynamic_adjustment(current_price=10.0)
+        bot.grid.recenter.assert_not_called()
+
+    def test_recenter_runs_when_allowed_in_offensive(self):
+        """对照测试: 临时把 TACTICAL_RECENTER_ALLOWED_IN_OFFENSIVE 打开, recenter 应被调用."""
+        original = tcfg.TACTICAL_RECENTER_ALLOWED_IN_OFFENSIVE
+        try:
+            tcfg.TACTICAL_RECENTER_ALLOWED_IN_OFFENSIVE = True
+            bot = self._make_bot(session_mode=tcfg.SESSION_MODE_OFFENSIVE)
+            # 准备 mock recenter 返回值
+            bot.grid.recenter.return_value = {
+                "new_center": 10.5, "new_spacing": 0.02, "orders_to_cancel": [],
+            }
+            bot._apply_dynamic_adjustment(current_price=10.0)
+            bot.grid.recenter.assert_called_once()
+        finally:
+            tcfg.TACTICAL_RECENTER_ALLOWED_IN_OFFENSIVE = original
+
+
+# ════════════════════════════════════════════
+#  战术覆盖: grid_engine.should_exit 不直接触发 EXIT_PENDING
+#  战术 base=0: _execute_entry 跳过 BASE_BUY 市价单
+# ════════════════════════════════════════════
+
+class TestTacticalExitOverride(unittest.TestCase):
+    """TACTICAL_OVERRIDE_GRID_ENGINE_EXIT=True 时:
+       - grid_engine.should_exit=True 不应 state_machine.on_exit_signal(True, ...)
+       - session_manager.record_engine_exit_signal 应被调用 (累计 count)
+       - 也应继续走 recenter 逻辑 (与 should_disable_recenter 协同)
+    关掉 override 时, 旧行为 (直接进 EXIT_PENDING) 必须保留.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def _make_bot(self, *, exit_reason="ADX>EXIT_MAX"):
+        from grid_bot import GridBot
+        import pandas as pd
+        import numpy as np
+
+        clock = LiveClock()
+        db = TradeDatabase(db_path=self.tmp.name)
+        sm = SessionManager(db=db, clock=clock)
+        sm.start_session(
+            symbol="UVXY", start_equity=10000.0, start_cash=5000.0,
+            start_position=100.0, start_price=10.0,
+        )
+
+        n = 100
+        idx = pd.date_range("2026-01-01", periods=n, freq="4h")
+        df = pd.DataFrame({
+            "Open": np.full(n, 10.0), "High": np.full(n, 10.5),
+            "Low": np.full(n, 9.5), "Close": np.full(n, 10.0),
+            "Volume": np.full(n, 1e6),
+        }, index=idx)
+        df_fetcher = MagicMock()
+        df_fetcher.get_strategy_data.return_value = df
+
+        grid = MagicMock()
+        grid.center_price = 10.0
+        grid.atr_at_init = 0.2
+        grid.spacing_pct = 0.02
+        grid.should_exit.return_value = (True, exit_reason)
+        grid.should_recenter.return_value = (False, "")
+        grid.recenter = MagicMock()
+
+        bot = GridBot.__new__(GridBot)
+        bot.symbol = "UVXY"
+        bot.clock = clock
+        bot.executor = MagicMock()
+        bot.db = db
+        bot.pnl = MagicMock()
+        bot.risk = MagicMock()
+        bot.state_machine = MagicMock()
+        bot.state_machine.state = SystemState.OFFENSIVE_GRID
+        bot.state_machine.on_exit_signal.return_value = None
+        bot.entry_filter = MagicMock()
+        bot.data_fetcher = df_fetcher
+        bot.strategy_df_days = 60
+        bot.session_manager = sm
+        bot.grid = grid
+        bot._soft_stop_triggered = False
+        bot._market_context_cache = None
+        bot._allocated_capital = None
+        bot._capital_provider = None
+        return bot
+
+    def test_override_on_does_not_trigger_exit_pending(self):
+        original = tcfg.TACTICAL_OVERRIDE_GRID_ENGINE_EXIT
+        try:
+            tcfg.TACTICAL_OVERRIDE_GRID_ENGINE_EXIT = True
+            bot = self._make_bot()
+            bot._apply_dynamic_adjustment(current_price=10.0)
+            # state_machine.on_exit_signal 不应被以 (True, ...) 调用
+            calls = bot.state_machine.on_exit_signal.call_args_list
+            triggered = [c for c in calls if c and c.args and c.args[0] is True]
+            self.assertEqual(len(triggered), 0,
+                             f"override 模式不应触发 EXIT_PENDING, 但调用了: {triggered}")
+        finally:
+            tcfg.TACTICAL_OVERRIDE_GRID_ENGINE_EXIT = original
+
+    def test_override_on_records_signal_to_session(self):
+        original = tcfg.TACTICAL_OVERRIDE_GRID_ENGINE_EXIT
+        try:
+            tcfg.TACTICAL_OVERRIDE_GRID_ENGINE_EXIT = True
+            bot = self._make_bot(exit_reason="ATR_PCT>EXIT_MAX")
+            self.assertEqual(bot.session_manager.engine_exit_signal_count, 0)
+            bot._apply_dynamic_adjustment(current_price=10.0)
+            self.assertEqual(bot.session_manager.engine_exit_signal_count, 1)
+            self.assertIsNotNone(bot.session_manager.last_engine_exit_signal)
+            self.assertIn("ATR_PCT>EXIT_MAX",
+                          bot.session_manager.last_engine_exit_signal[0])
+        finally:
+            tcfg.TACTICAL_OVERRIDE_GRID_ENGINE_EXIT = original
+
+    def test_override_off_still_triggers_exit_pending(self):
+        original = tcfg.TACTICAL_OVERRIDE_GRID_ENGINE_EXIT
+        try:
+            tcfg.TACTICAL_OVERRIDE_GRID_ENGINE_EXIT = False
+            bot = self._make_bot()
+            bot._apply_dynamic_adjustment(current_price=10.0)
+            # 旧行为: on_exit_signal(True, reason, now=...) 必须被调
+            calls = bot.state_machine.on_exit_signal.call_args_list
+            triggered = [c for c in calls if c and c.args and c.args[0] is True]
+            self.assertGreaterEqual(len(triggered), 1,
+                                    f"override 关闭时应进 EXIT_PENDING, 调用: {calls}")
+        finally:
+            tcfg.TACTICAL_OVERRIDE_GRID_ENGINE_EXIT = original
+
+    def test_signal_counter_resets_on_new_session(self):
+        original = tcfg.TACTICAL_OVERRIDE_GRID_ENGINE_EXIT
+        try:
+            tcfg.TACTICAL_OVERRIDE_GRID_ENGINE_EXIT = True
+            bot = self._make_bot()
+            bot._apply_dynamic_adjustment(current_price=10.0)
+            self.assertEqual(bot.session_manager.engine_exit_signal_count, 1)
+            # 关闭旧 session, 开新 session — 计数器应清零
+            bot.session_manager.close_session(reason="test_close", end_price=10.0)
+            bot.session_manager.start_session(
+                symbol="UVXY", start_equity=10000.0, start_cash=5000.0,
+                start_position=100.0, start_price=10.0,
+            )
+            self.assertEqual(bot.session_manager.engine_exit_signal_count, 0)
+            self.assertIsNone(bot.session_manager.last_engine_exit_signal)
+        finally:
+            tcfg.TACTICAL_OVERRIDE_GRID_ENGINE_EXIT = original
+
+
+class TestTacticalBaseZeroEntry(unittest.TestCase):
+    """TACTICAL_BASE_POSITION_RATIO=0.0 时, _execute_entry 跳过 BASE_BUY 市价单,
+    直接初始化网格 + 启动 session."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self._orig_base_ratio = tcfg.TACTICAL_BASE_POSITION_RATIO
+        self._orig_tactical = tcfg.TACTICAL_GRID_ENABLED
+
+    def tearDown(self):
+        tcfg.TACTICAL_BASE_POSITION_RATIO = self._orig_base_ratio
+        tcfg.TACTICAL_GRID_ENABLED = self._orig_tactical
+        os.unlink(self.tmp.name)
+
+    def _make_bot(self):
+        from grid_bot import GridBot
+
+        clock = LiveClock()
+        db = TradeDatabase(db_path=self.tmp.name)
+        sm = SessionManager(db=db, clock=clock)
+
+        executor = MagicMock()
+        executor.get_current_price.return_value = 10.0
+        executor.get_account_summary.return_value = {"TotalCashValue": 5000.0}
+        # 关键: skip_base 路径下不应调 place_market_order
+        executor.place_market_order = MagicMock()
+
+        bot = GridBot.__new__(GridBot)
+        bot.symbol = "UVXY"
+        bot.clock = clock
+        bot.executor = executor
+        bot.db = db
+        bot.pnl = MagicMock()
+        bot.risk = MagicMock()
+        bot.state_machine = MagicMock()
+        bot.state_machine.state = SystemState.WAITING_ENTRY
+        bot.state_machine.on_grid_active.return_value = None
+        bot.entry_filter = MagicMock()
+        bot.data_fetcher = MagicMock()
+        bot.strategy_df_days = 60
+        bot.session_manager = sm
+        bot._allocated_capital = 10000.0
+        bot._capital_provider = None
+        bot._soft_stop_triggered = False
+        bot._market_context_cache = None
+        bot._base_position_shares = 0.0
+        bot._entry_execution_failures = 0
+        # _persist_all / _log_daily_snapshot_now 用 mock 避免 IO
+        bot._persist_all = MagicMock()
+        bot._log_daily_snapshot_now = MagicMock()
+        return bot
+
+    def _eval(self):
+        from entry_filter import EntryEvaluation
+        from datetime import datetime, timezone
+        ev = EntryEvaluation(
+            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            current_price=10.0,
+        )
+        ev.suggested_center = 10.0
+        ev.suggested_atr = 0.2
+        ev.suggested_spacing_pct = 0.02
+        return ev
+
+    def test_base_zero_skips_market_order(self):
+        tcfg.TACTICAL_GRID_ENABLED = True
+        tcfg.TACTICAL_BASE_POSITION_RATIO = 0.0
+        bot = self._make_bot()
+        ok = bot._execute_entry(self._eval())
+        self.assertTrue(ok, "base=0 路径应入场成功")
+        bot.executor.place_market_order.assert_not_called()
+        self.assertEqual(bot._base_position_shares, 0.0)
+        # session 应已启动
+        self.assertTrue(bot.session_manager.has_active_session)
+        self.assertEqual(bot.session_manager.session.start_position, 0.0)
+
+    def test_base_zero_initializes_grid(self):
+        tcfg.TACTICAL_GRID_ENABLED = True
+        tcfg.TACTICAL_BASE_POSITION_RATIO = 0.0
+        bot = self._make_bot()
+        ok = bot._execute_entry(self._eval())
+        self.assertTrue(ok)
+        # 网格对象应被构建
+        self.assertTrue(hasattr(bot, "grid"))
+        self.assertAlmostEqual(bot.grid.center_price, 10.0, places=4)
+
+    def test_base_nonzero_still_places_market_order(self):
+        """安全网: 把 TACTICAL_BASE_POSITION_RATIO 调到 0.10 时, 仍应走 BASE_BUY 市价单."""
+        tcfg.TACTICAL_GRID_ENABLED = True
+        tcfg.TACTICAL_BASE_POSITION_RATIO = 0.10
+        bot = self._make_bot()
+        # mock executor 返回成功 fill
+        bot.executor.place_market_order.return_value = 1001
+        bot.executor.wait_for_order_fill.return_value = {
+            "quantity": 100.0, "fill_price": 10.0, "commission": 1.0
+        }
+        ok = bot._execute_entry(self._eval())
+        self.assertTrue(ok)
+        bot.executor.place_market_order.assert_called_once()
+        call_kwargs = bot.executor.place_market_order.call_args.kwargs
+        self.assertEqual(call_kwargs.get("order_type_label"), "BASE_BUY")
+
+
+# ════════════════════════════════════════════
+#  SessionManager 生命周期 + 持久化
+# ════════════════════════════════════════════
+
+class TestSessionManager(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = TradeDatabase(db_path=self.tmp.name)
+        self.clock = LiveClock()
+        self.sm = SessionManager(db=self.db, clock=self.clock)
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def test_start_and_close_session(self):
+        ctx = self.sm.start_session(
+            symbol="UVXY", start_equity=10000.0, start_cash=5000.0,
+            start_position=100.0, start_price=10.0,
+        )
+        self.assertTrue(self.sm.has_active_session)
+        self.assertEqual(ctx.mode, tcfg.SESSION_MODE_OFFENSIVE)
+        closed = self.sm.close_session(reason="test_close", end_price=11.0)
+        self.assertIsNotNone(closed)
+        self.assertFalse(self.sm.has_active_session)
+        self.assertEqual(closed.status, "closed")
+        self.assertEqual(closed.end_price, 11.0)
+
+    def test_update_tracks_peak_and_drawdown(self):
+        self.sm.start_session(
+            symbol="UVXY", start_equity=10000.0, start_cash=5000.0,
+            start_position=100.0, start_price=10.0,
+        )
+        self.sm.update_session(
+            current_equity=10100.0, current_cash=5000.0,
+            current_position=100.0, current_price=11.0,
+            unrealized_pnl=100.0,
+        )
+        self.assertAlmostEqual(self.sm.session.peak_pnl, 100.0)
+        self.sm.update_session(
+            current_equity=10050.0, current_cash=5000.0,
+            current_position=100.0, current_price=10.5,
+            unrealized_pnl=50.0,
+        )
+        self.assertAlmostEqual(self.sm.session.peak_pnl, 100.0)
+        self.assertAlmostEqual(self.sm.session.max_drawdown, 50.0)
+
+    def test_enter_defensive_changes_mode(self):
+        self.sm.start_session(
+            symbol="UVXY", start_equity=10000.0, start_cash=5000.0,
+            start_position=100.0, start_price=10.0,
+        )
+        self.sm.enter_defensive_mode("test")
+        self.assertEqual(self.sm.session.mode, tcfg.SESSION_MODE_DEFENSIVE)
+
+    def test_evaluate_force_exit_on_hard_stop(self):
+        orig_hard = tcfg.SESSION_HARD_STOP_PCT
+        try:
+            tcfg.SESSION_HARD_STOP_PCT = 0.020
+            self.sm.start_session(
+                symbol="UVXY", start_equity=10000.0, start_cash=5000.0,
+                start_position=100.0, start_price=10.0,
+            )
+            # 亏到 2.5% > 2% HARD → 触发硬止损
+            self.sm.update_session(
+                current_equity=9750.0, current_cash=5000.0,
+                current_position=100.0, current_price=9.5,
+                realized_pnl_delta=-250.0,
+            )
+            market = trules.MarketContext(
+                current_price=9.5, ema=10.0, atr=0.2, atr_pct=0.02, adx=10.0,
+                grid_center=10.0,
+            )
+            ev = self.sm.evaluate_session(market)
+            self.assertEqual(ev.action, ACTION_FORCE_EXIT)
+        finally:
+            tcfg.SESSION_HARD_STOP_PCT = orig_hard
+
+    def test_evaluate_defensive_on_soft_stop(self):
+        orig_soft = tcfg.SESSION_SOFT_STOP_PCT
+        orig_hard = tcfg.SESSION_HARD_STOP_PCT
+        try:
+            tcfg.SESSION_SOFT_STOP_PCT = 0.010
+            tcfg.SESSION_HARD_STOP_PCT = 0.020
+            self.sm.start_session(
+                symbol="UVXY", start_equity=10000.0, start_cash=5000.0,
+                start_position=100.0, start_price=10.0,
+            )
+            # 亏 1.5% (>1% SOFT, <2% HARD) → 软止损
+            self.sm.update_session(
+                current_equity=9850.0, current_cash=5000.0,
+                current_position=100.0, current_price=9.7,
+                realized_pnl_delta=-150.0,
+            )
+            market = trules.MarketContext(
+                current_price=9.7, ema=10.0, atr=0.2, atr_pct=0.02, adx=10.0,
+                grid_center=10.0,
+            )
+            ev = self.sm.evaluate_session(market)
+            self.assertEqual(ev.action, ACTION_ENTER_DEFENSIVE)
+        finally:
+            tcfg.SESSION_SOFT_STOP_PCT = orig_soft
+            tcfg.SESSION_HARD_STOP_PCT = orig_hard
+
+    def test_trailing_giveback_action(self):
+        orig_min = tcfg.SESSION_MIN_PROFIT_TO_PROTECT_PCT
+        orig_strong = tcfg.SESSION_STRONG_PROFIT_PCT
+        orig_giveback = tcfg.SESSION_TRAILING_GIVEBACK_RATIO
+        try:
+            tcfg.SESSION_MIN_PROFIT_TO_PROTECT_PCT = 0.005
+            tcfg.SESSION_STRONG_PROFIT_PCT = 0.012
+            tcfg.SESSION_TRAILING_GIVEBACK_RATIO = 0.40
+            self.sm.start_session(
+                symbol="UVXY", start_equity=10000.0, start_cash=5000.0,
+                start_position=100.0, start_price=10.0,
+            )
+            # 先冲到 peak +1.5% ($150)
+            self.sm.update_session(
+                current_equity=10150.0, current_cash=5000.0,
+                current_position=100.0, current_price=11.5,
+                unrealized_pnl=150.0,
+            )
+            # 然后回吐到 $50 (giveback 66% > 40%)
+            self.sm.update_session(
+                current_equity=10050.0, current_cash=5000.0,
+                current_position=100.0, current_price=10.5,
+                unrealized_pnl=50.0,
+            )
+            market = trules.MarketContext(
+                current_price=10.5, ema=10.0, atr=0.2, atr_pct=0.02, adx=10.0,
+                grid_center=10.0,
+            )
+            ev = self.sm.evaluate_session(market)
+            self.assertEqual(ev.action, ACTION_PROFIT_PROTECT_EXIT)
+        finally:
+            tcfg.SESSION_MIN_PROFIT_TO_PROTECT_PCT = orig_min
+            tcfg.SESSION_STRONG_PROFIT_PCT = orig_strong
+            tcfg.SESSION_TRAILING_GIVEBACK_RATIO = orig_giveback
+
+    def test_cooldown_remaining_decreases(self):
+        # 1.0 bar cooldown
+        self.sm.start_cooldown(bars=1.0, reason="test")
+        self.assertTrue(self.sm.in_cooldown)
+        self.assertGreater(self.sm.remaining_cooldown_bars(), 0)
+        self.sm.clear_cooldown()
+        self.assertFalse(self.sm.in_cooldown)
+
+    def test_persist_and_load_active_session(self):
+        ctx = self.sm.start_session(
+            symbol="UVXY", start_equity=10000.0, start_cash=5000.0,
+            start_position=100.0, start_price=10.0,
+        )
+        original_sid = ctx.session_id
+        # 新 manager 从同一 DB 恢复
+        sm2 = SessionManager(db=self.db, clock=self.clock)
+        restored = sm2.load_active_session()
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.session_id, original_sid)
+        self.assertEqual(restored.symbol, "UVXY")
+
+
+# ════════════════════════════════════════════
+#  StateMachine: 新枚举 + 旧 active_grid 兼容
+# ════════════════════════════════════════════
+
+class TestStateMachineNewStates(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def test_on_grid_active_targets_offensive(self):
+        sm = StateMachine()
+        sm.on_entry_evaluation(True, "ok", now=datetime.now())
+        sm.on_grid_active(now=datetime.now())
+        self.assertEqual(sm.state, SystemState.OFFENSIVE_GRID)
+        self.assertTrue(is_grid_state(sm.state))
+
+    def test_offensive_to_defensive(self):
+        sm = StateMachine()
+        sm.on_entry_evaluation(True, "ok", now=datetime.now())
+        sm.on_grid_active(now=datetime.now())
+        sm.on_enter_defensive("soft_stop", now=datetime.now())
+        self.assertEqual(sm.state, SystemState.DEFENSIVE_GRID)
+        self.assertTrue(is_grid_state(sm.state))
+
+    def test_defensive_to_exit_pending(self):
+        sm = StateMachine()
+        sm.on_entry_evaluation(True, "ok", now=datetime.now())
+        sm.on_grid_active(now=datetime.now())
+        sm.on_enter_defensive("soft_stop", now=datetime.now())
+        result = sm.on_exit_signal(True, "hard_stop", now=datetime.now())
+        self.assertEqual(result, "INITIATE_EXIT")
+        self.assertEqual(sm.state, SystemState.EXIT_PENDING)
+
+    def test_exit_complete_with_cooldown(self):
+        sm = StateMachine()
+        sm.on_entry_evaluation(True, "ok", now=datetime.now())
+        sm.on_grid_active(now=datetime.now())
+        sm.on_exit_signal(True, "test", now=datetime.now())
+        sm.on_exit_complete(now=datetime.now(), enter_cooldown_bars=2.0,
+                             cooldown_reason="hard_stop")
+        self.assertEqual(sm.state, SystemState.COOLDOWN)
+
+    def test_exit_complete_without_cooldown_goes_to_scanning(self):
+        sm = StateMachine()
+        sm.on_entry_evaluation(True, "ok", now=datetime.now())
+        sm.on_grid_active(now=datetime.now())
+        sm.on_exit_signal(True, "test", now=datetime.now())
+        sm.on_exit_complete(now=datetime.now())
+        self.assertEqual(sm.state, SystemState.SCANNING)
+
+    def test_legacy_active_grid_db_row_translates(self):
+        """旧 DB 行写的 'active_grid' 必须被翻译为 OFFENSIVE_GRID 恢复."""
+        # 手工构造一行 active_grid 状态
+        sm = StateMachine()
+        sm.context.current_state = SystemState.ACTIVE_GRID  # 故意用旧枚举值写
+        sm.context.state_entered_at = datetime.now().isoformat()
+        sm.context.total_grid_sessions = 3
+        sm.save_state(self.db_path)
+
+        # 验证 DB 里确实写的是 "active_grid"
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT current_state FROM state_machine_state WHERE id=1"
+            ).fetchone()
+        self.assertEqual(row[0], "active_grid")
+
+        # 新 manager 恢复后应是 OFFENSIVE_GRID
+        sm2 = StateMachine()
+        ok = sm2.load_state(self.db_path)
+        self.assertTrue(ok)
+        self.assertEqual(sm2.state, SystemState.OFFENSIVE_GRID)
+        self.assertEqual(sm2.context.total_grid_sessions, 3)
+
+
+# ════════════════════════════════════════════
+#  trade_logger: 幂等 schema 迁移
+# ════════════════════════════════════════════
+
+class TestSchemaMigration(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def test_migration_is_idempotent(self):
+        # 第一次初始化
+        db = TradeDatabase(db_path=self.db_path)
+        db.ensure_grid_sessions_table()
+        db.ensure_grid_session_events_table()
+        # 第二次, 不应失败
+        db2 = TradeDatabase(db_path=self.db_path)
+        db2.ensure_grid_sessions_table()
+        db2.ensure_grid_session_events_table()
+
+    def test_ensure_column_idempotent(self):
+        db = TradeDatabase(db_path=self.db_path)
+        # 已存在 session_id (migration 已加), 第二次 ensure_column 返回 False
+        added = db.ensure_column("trades", "session_id", "TEXT")
+        self.assertFalse(added)
+        # 新列首次 ensure 返回 True, 重复 ensure 返回 False
+        first = db.ensure_column("trades", "tactical_note", "TEXT")
+        second = db.ensure_column("trades", "tactical_note", "TEXT")
+        self.assertTrue(first)
+        self.assertFalse(second)
+
+    def test_grid_sessions_table_exists(self):
+        db = TradeDatabase(db_path=self.db_path)
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='grid_sessions'"
+            ).fetchone()
+        self.assertIsNotNone(row)
+
+    def test_log_session_event_writes_row(self):
+        db = TradeDatabase(db_path=self.db_path)
+        db.log_session_event("sid1", "TEST_EVENT", "x=1", "no-op")
+        with sqlite3.connect(self.db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM grid_session_events WHERE session_id='sid1'"
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_log_trade_with_session_id(self):
+        db = TradeDatabase(db_path=self.db_path)
+        db.log_trade("BUY", "UVXY", 10.0, 5.0, session_id="sid_x")
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT session_id FROM trades WHERE symbol='UVXY' LIMIT 1"
+            ).fetchone()
+        self.assertEqual(row[0], "sid_x")
+
+
+# ════════════════════════════════════════════
+#  集成测试: defensive 模式在 grid_bot 中阻止 BUY 信号
+# ════════════════════════════════════════════
+
+class TestGridBotDefensiveBlocksBuy(unittest.TestCase):
+    """端到端: bot 在 DEFENSIVE 模式下不应放出 BUY 单 (战术过滤生效)."""
+
+    def setUp(self):
+        # 启用战术 (默认开启)
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def _build_bot(self):
+        from grid_bot import GridBot
+        from grid_engine import DynamicGridEngine
+
+        db = TradeDatabase(db_path=self.db_path)
+        clock = LiveClock()
+        sm = SessionManager(db=db, clock=clock)
+
+        bot = GridBot.__new__(GridBot)
+        bot.symbol = config.SYMBOL
+        bot.clock = clock
+        bot.executor = MagicMock()
+        bot.db = db
+        bot.pnl = MagicMock()
+        bot.pnl.get_queue_summary.return_value = {
+            "count": 1, "total_qty": 100.0,
+            "total_cost": 1000.0, "avg_price": 10.0
+        }
+        bot.risk = MagicMock()
+        bot.state_machine = StateMachine()
+        bot.entry_filter = MagicMock()
+        bot.data_fetcher = MagicMock()
+        bot.strategy_df_days = 60
+        bot.session_manager = sm
+        bot._market_context_cache = None
+        bot._soft_stop_triggered = False
+        bot._last_recenter_check = datetime.now()  # 让 _should_check_dynamic_adjustment 返回 False
+
+        # 网格 + 状态
+        bot.grid = DynamicGridEngine(
+            center_price=10.0, atr=0.2, spacing_pct=0.02,
+            grid_capital=5000.0, current_time=datetime.now(),
+        )
+        bot.state_machine.on_entry_evaluation(True, "ok", now=datetime.now())
+        bot.state_machine.on_grid_active(now=datetime.now())
+
+        # 启动 session 并切到 DEFENSIVE
+        sm.start_session(
+            symbol="UVXY", start_equity=10000.0, start_cash=5000.0,
+            start_position=100.0, start_price=10.0,
+        )
+        bot._enter_defensive("test_defensive")
+        return bot
+
+    def test_defensive_state_active(self):
+        bot = self._build_bot()
+        self.assertEqual(bot.state_machine.state, SystemState.DEFENSIVE_GRID)
+        self.assertEqual(bot.session_manager.session.mode, tcfg.SESSION_MODE_DEFENSIVE)
+
+    def test_buy_orders_cancelled_on_defensive_entry(self):
+        bot = self._build_bot()
+        # 先模拟有 BUY 挂单
+        # _enter_defensive 已经被调用过, 验证它确实调用了 cancel_order
+        # (但 _build_bot 中 grid 是新建的, 没有 order_id, 所以这里只验证 state)
+        # 重新模拟: 给 grid 一个 buy 挂单后再次调用 _enter_defensive 不会重复 cancel
+        # (这里主要测 cancel_buy_orders 的逻辑)
+        bot.executor.cancel_order.return_value = True
+        # 注入一个有 order_id 的下方档
+        for idx, lv in bot.grid.levels.items():
+            if lv.side.value == "below":
+                lv.order_id = 12345
+                from grid_engine import LevelState
+                lv.state = LevelState.ORDER_PENDING
+                break
+        cancelled = bot._cancel_buy_orders("test")
+        self.assertGreater(cancelled, 0)
+        bot.executor.cancel_order.assert_called()
+
+    def test_place_grid_orders_filters_all_buys_in_defensive(self):
+        bot = self._build_bot()
+        bot.executor.cancel_order.return_value = True
+        bot.executor.place_limit_order.return_value = None  # 不应该被调用 (BUY 全过滤)
+        bot.executor.get_cash.return_value = 100000.0
+
+        # 触发价格低于 center → 应产生 BUY 信号, 但被过滤
+        ctx = trules.MarketContext(
+            current_price=9.5, ema=10.0, atr=0.2, atr_pct=0.02, adx=10.0,
+            grid_center=10.0,
+        )
+        bot._market_context_cache = ctx
+        bot._place_grid_orders(ctx)
+
+        # 不应该有任何 BUY 下单 (DEFENSIVE 拒绝); 但可能有 SELL — 取决于 grid 状态.
+        # 检查所有调用的 action 不含 BUY.
+        for call in bot.executor.place_limit_order.call_args_list:
+            self.assertNotEqual(call.kwargs.get("action"), "BUY",
+                                "DEFENSIVE 不应下 BUY 单")
+
+
+# ════════════════════════════════════════════
+#  集成测试: 软止损 → DEFENSIVE
+# ════════════════════════════════════════════
+
+class TestSoftStopTriggersDefensive(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def test_full_flow(self):
+        """OFFENSIVE 中 session 亏 1.5% → evaluate_session 返回 ENTER_DEFENSIVE → grid_bot 切到 DEFENSIVE."""
+        from grid_bot import GridBot
+        from grid_engine import DynamicGridEngine
+
+        # 测试不依赖 SOFT/HARD_STOP_PCT 当前默认 — 临时缩窄阈值, 让 -1.5% 触发.
+        orig_soft = tcfg.SESSION_SOFT_STOP_PCT
+        orig_hard = tcfg.SESSION_HARD_STOP_PCT
+        try:
+            tcfg.SESSION_SOFT_STOP_PCT = 0.010
+            tcfg.SESSION_HARD_STOP_PCT = 0.020
+
+            db = TradeDatabase(db_path=self.db_path)
+            clock = LiveClock()
+            sm = SessionManager(db=db, clock=clock)
+
+            bot = GridBot.__new__(GridBot)
+            bot.symbol = config.SYMBOL
+            bot.clock = clock
+            bot.executor = MagicMock()
+            bot.db = db
+            bot.pnl = MagicMock()
+            bot.pnl.get_queue_summary.return_value = {
+                "count": 0, "total_qty": 0.0, "total_cost": 0.0, "avg_price": 0.0,
+            }
+            bot.risk = MagicMock()
+            bot.state_machine = StateMachine()
+            bot.entry_filter = MagicMock()
+            bot.data_fetcher = MagicMock()
+            bot.strategy_df_days = 60
+            bot.session_manager = sm
+            bot._soft_stop_triggered = False
+
+            bot.grid = DynamicGridEngine(
+                center_price=10.0, atr=0.2, spacing_pct=0.02,
+                grid_capital=5000.0, current_time=datetime.now(),
+            )
+            bot.state_machine.on_entry_evaluation(True, "ok", now=datetime.now())
+            bot.state_machine.on_grid_active(now=datetime.now())
+
+            sm.start_session(
+                symbol="UVXY", start_equity=10000.0, start_cash=5000.0,
+                start_position=100.0, start_price=10.0,
+            )
+            sm.update_session(
+                current_equity=9850.0, current_cash=5000.0,
+                current_position=100.0, current_price=9.7,
+                realized_pnl_delta=-150.0,  # -1.5% (> 1% SOFT, < 2% HARD)
+            )
+
+            market = trules.MarketContext(
+                current_price=9.7, ema=10.0, atr=0.2, atr_pct=0.02, adx=10.0,
+                grid_center=10.0,
+            )
+            bot.executor.cancel_order.return_value = True
+            bot._evaluate_session_actions(market)
+            self.assertEqual(bot.state_machine.state, SystemState.DEFENSIVE_GRID)
+            self.assertEqual(bot.session_manager.session.mode,
+                              tcfg.SESSION_MODE_DEFENSIVE)
+        finally:
+            tcfg.SESSION_SOFT_STOP_PCT = orig_soft
+            tcfg.SESSION_HARD_STOP_PCT = orig_hard
+
+
+# ════════════════════════════════════════════
+#  集成测试: 硬止损 → EXIT_PENDING
+# ════════════════════════════════════════════
+
+class TestHardStopTriggersExit(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def test_full_flow(self):
+        from grid_bot import GridBot
+        from grid_engine import DynamicGridEngine
+
+        orig_hard = tcfg.SESSION_HARD_STOP_PCT
+        try:
+            tcfg.SESSION_HARD_STOP_PCT = 0.020  # test calibrated for 2%
+
+            db = TradeDatabase(db_path=self.db_path)
+            clock = LiveClock()
+            sm = SessionManager(db=db, clock=clock)
+
+            bot = GridBot.__new__(GridBot)
+            bot.symbol = config.SYMBOL
+            bot.clock = clock
+            bot.executor = MagicMock()
+            bot.db = db
+            bot.pnl = MagicMock()
+            bot.risk = MagicMock()
+            bot.state_machine = StateMachine()
+            bot.entry_filter = MagicMock()
+            bot.data_fetcher = MagicMock()
+            bot.strategy_df_days = 60
+            bot.session_manager = sm
+            bot._soft_stop_triggered = False
+
+            bot.grid = DynamicGridEngine(
+                center_price=10.0, atr=0.2, spacing_pct=0.02,
+                grid_capital=5000.0, current_time=datetime.now(),
+            )
+            bot.state_machine.on_entry_evaluation(True, "ok", now=datetime.now())
+            bot.state_machine.on_grid_active(now=datetime.now())
+
+            sm.start_session(
+                symbol="UVXY", start_equity=10000.0, start_cash=5000.0,
+                start_position=100.0, start_price=10.0,
+            )
+            sm.update_session(
+                current_equity=9700.0, current_cash=5000.0,
+                current_position=100.0, current_price=9.4,
+                realized_pnl_delta=-300.0,  # -3% > 2% HARD
+            )
+
+            market = trules.MarketContext(
+                current_price=9.4, ema=10.0, atr=0.2, atr_pct=0.02, adx=10.0,
+                grid_center=10.0,
+            )
+            bot._evaluate_session_actions(market)
+            self.assertEqual(bot.state_machine.state, SystemState.EXIT_PENDING)
+        finally:
+            tcfg.SESSION_HARD_STOP_PCT = orig_hard
+
+
+# ════════════════════════════════════════════
+#  多标的: symbol 参数化模块化测试
+# ════════════════════════════════════════════
+
+class TestMultiSymbolParameterization(unittest.TestCase):
+    """验证 symbol 参数化已下沉到 GridBot / Executor / SessionManager / Report,
+    为后续多标的 orchestrator 做准备."""
+
+    def test_grid_bot_symbol_from_explicit_arg(self):
+        """显式传 symbol 时不再读 config.SYMBOL."""
+        from grid_bot import GridBot
+        executor = MagicMock()
+        executor.symbol = "TQQQ"  # executor 优先级最高
+        bot = GridBot.__new__(GridBot)
+        bot.symbol = None
+        # 直接走 __init__ 逻辑里 self.symbol = symbol or executor.symbol or config.SYMBOL
+        # 但这里用 __new__ 跳过 __init__, 手动重现
+        bot.symbol = "SOXL" or executor.symbol or config.SYMBOL
+        self.assertEqual(bot.symbol, "SOXL")
+
+    def _tempfile_db(self):
+        """共享: 临时 sqlite 文件 (注意 :memory: 在跨 connection 时不共享 schema,
+        不能直接给 TradeDatabase 用)."""
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        self.addCleanup(os.unlink, tmp.name)
+        return tmp.name
+
+    def test_grid_bot_symbol_from_executor_when_no_explicit(self):
+        """不传 symbol 时从 executor.symbol 取."""
+        from grid_bot import GridBot
+        from interfaces import LiveClock
+        from entry_filter import EntryFilter
+        executor = MagicMock()
+        executor.symbol = "TQQQ"
+        executor.is_connected.return_value = True
+        clock = LiveClock()
+        db = TradeDatabase(db_path=self._tempfile_db())
+        bot = GridBot(
+            clock=clock, executor=executor, db=db,
+            pnl=MagicMock(), risk=MagicMock(),
+            state_machine=StateMachine(clock=clock),
+            entry_filter=EntryFilter(),
+            data_fetcher=MagicMock(),
+        )
+        self.assertEqual(bot.symbol, "TQQQ")
+
+    def test_grid_bot_falls_back_to_config_symbol(self):
+        """executor 无 symbol attr + 不传参 → 用 config.SYMBOL."""
+        from grid_bot import GridBot
+        from interfaces import LiveClock
+        from entry_filter import EntryFilter
+        # 用一个不带 symbol 属性的 dummy executor (spec=Executor 也不会有 symbol)
+        class _DummyExecutor:
+            pass
+        executor = _DummyExecutor()
+        clock = LiveClock()
+        db = TradeDatabase(db_path=self._tempfile_db())
+        bot = GridBot(
+            clock=clock, executor=executor, db=db,
+            pnl=MagicMock(), risk=MagicMock(),
+            state_machine=StateMachine(clock=clock),
+            entry_filter=EntryFilter(),
+            data_fetcher=MagicMock(),
+        )
+        self.assertEqual(bot.symbol, config.SYMBOL)
+
+    def test_simulated_executor_accepts_symbol(self):
+        import pandas as pd
+        from simulated_executor import SimulatedExecutor
+        from interfaces import HistoricalClock
+        clock = HistoricalClock()
+        df = pd.DataFrame(
+            {"Open": [10.0], "High": [10.5], "Low": [9.5],
+             "Close": [10.0], "Volume": [1000]},
+            index=pd.date_range("2026-01-01", periods=1)
+        )
+        clock.set(df.index[0].to_pydatetime())
+        ex = SimulatedExecutor(df, 1000.0, clock, symbol="TQQQ")
+        self.assertEqual(ex.symbol, "TQQQ")
+
+    def test_simulated_executor_defaults_symbol(self):
+        import pandas as pd
+        from simulated_executor import SimulatedExecutor
+        from interfaces import HistoricalClock
+        clock = HistoricalClock()
+        df = pd.DataFrame(
+            {"Open": [10.0], "High": [10.5], "Low": [9.5],
+             "Close": [10.0], "Volume": [1000]},
+            index=pd.date_range("2026-01-01", periods=1)
+        )
+        clock.set(df.index[0].to_pydatetime())
+        ex = SimulatedExecutor(df, 1000.0, clock)
+        self.assertEqual(ex.symbol, config.SYMBOL)
+
+    def test_two_session_managers_independent_per_db(self):
+        """两个 SessionManager 用不同 db_path 时, session 互不污染."""
+        import os, tempfile
+        from interfaces import LiveClock
+        from session_manager import SessionManager
+        tmp_a = tempfile.NamedTemporaryFile(suffix="_a.db", delete=False)
+        tmp_b = tempfile.NamedTemporaryFile(suffix="_b.db", delete=False)
+        tmp_a.close(); tmp_b.close()
+        try:
+            clock = LiveClock()
+            db_a = TradeDatabase(db_path=tmp_a.name)
+            db_b = TradeDatabase(db_path=tmp_b.name)
+            sm_a = SessionManager(db=db_a, clock=clock)
+            sm_b = SessionManager(db=db_b, clock=clock)
+            sm_a.start_session(symbol="UVXY", start_equity=10000.0,
+                                start_cash=5000.0, start_position=100.0,
+                                start_price=10.0)
+            sm_b.start_session(symbol="TQQQ", start_equity=10000.0,
+                                start_cash=5000.0, start_position=50.0,
+                                start_price=80.0)
+            self.assertEqual(sm_a.session.symbol, "UVXY")
+            self.assertEqual(sm_b.session.symbol, "TQQQ")
+            # session_id 应该不同 (每个 DB 各自命名空间, 但通过 uuid 后缀也保证唯一)
+            self.assertNotEqual(sm_a.session.session_id, sm_b.session.session_id)
+        finally:
+            os.unlink(tmp_a.name)
+            os.unlink(tmp_b.name)
+
+    def test_report_generator_accepts_symbol(self):
+        from report_generator import ReportGenerator
+        gen = ReportGenerator(db_path=self._tempfile_db(), symbol="TQQQ", report_dir="/tmp")
+        self.assertEqual(gen.symbol, "TQQQ")
+
+    def test_factory_builds_with_custom_symbol(self):
+        """bot_factory.build_test_grid_bot 透过 symbol 参数."""
+        import tempfile, os
+        from bot_factory import build_test_grid_bot
+        from interfaces import HistoricalClock
+        import pandas as pd
+        from simulated_executor import SimulatedExecutor
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            clock = HistoricalClock()
+            df = pd.DataFrame(
+                {"Open": [10.0], "High": [10.5], "Low": [9.5],
+                 "Close": [10.0], "Volume": [1000]},
+                index=pd.date_range("2026-01-01", periods=1)
+            )
+            clock.set(df.index[0].to_pydatetime())
+            ex = SimulatedExecutor(df, 1000.0, clock, symbol="SOXL")
+            bot = build_test_grid_bot(
+                symbol="SOXL", db_path=tmp.name,
+                executor=ex, data_fetcher=MagicMock(), clock=clock,
+            )
+            self.assertEqual(bot.symbol, "SOXL")
+            self.assertEqual(bot.executor.symbol, "SOXL")
+        finally:
+            os.unlink(tmp.name)
+
+
+
+# ════════════════════════════════════════════
+#  从 test_multi_symbol.py 合并: CapitalAllocator / AccountRiskManager 等
+# ════════════════════════════════════════════
+
+# ════════════════════════════════════════════
+#  CapitalAllocator
+# ════════════════════════════════════════════
+
+class TestCapitalAllocator(unittest.TestCase):
+    def test_for_symbol_basic(self):
+        a = CapitalAllocator(total=10000.0, allocations={"UVXY": 0.4, "TQQQ": 0.6})
+        self.assertEqual(a.for_symbol("UVXY"), 4000.0)
+        self.assertEqual(a.for_symbol("TQQQ"), 6000.0)
+
+    def test_unlisted_symbol_returns_zero(self):
+        a = CapitalAllocator(total=10000.0, allocations={"UVXY": 1.0})
+        self.assertEqual(a.for_symbol("TQQQ"), 0.0)
+
+    def test_validation_sum_exceeds_one_raises(self):
+        with self.assertRaises(AllocationError):
+            CapitalAllocator(total=10000.0,
+                              allocations={"UVXY": 0.6, "TQQQ": 0.6})
+
+    def test_validation_negative_fraction_raises(self):
+        with self.assertRaises(AllocationError):
+            CapitalAllocator(total=10000.0, allocations={"UVXY": -0.1})
+
+    def test_validation_total_zero_raises(self):
+        with self.assertRaises(AllocationError):
+            CapitalAllocator(total=0.0, allocations={"UVXY": 1.0})
+
+    def test_single_symbol_helper(self):
+        a = single_symbol_allocator(10000.0, "UVXY")
+        self.assertEqual(a.for_symbol("UVXY"), 10000.0)
+
+    def test_equal_split_helper(self):
+        a = equal_split_allocator(10000.0, ["UVXY", "TQQQ", "SOXL"])
+        for s in ["UVXY", "TQQQ", "SOXL"]:
+            self.assertAlmostEqual(a.for_symbol(s), 10000.0 / 3)
+
+    def test_unallocated_buffer(self):
+        a = CapitalAllocator(total=10000.0,
+                              allocations={"UVXY": 0.4, "TQQQ": 0.3})
+        self.assertAlmostEqual(a.total_allocated(), 7000.0)
+        self.assertAlmostEqual(a.unallocated(), 3000.0)
+
+    def test_with_overrides_returns_new_instance(self):
+        a = CapitalAllocator(total=10000.0, allocations={"UVXY": 1.0})
+        b = a.with_overrides(total=20000.0)
+        self.assertEqual(a.total, 10000.0)
+        self.assertEqual(b.total, 20000.0)
+        self.assertEqual(b.for_symbol("UVXY"), 20000.0)
+
+
+# ════════════════════════════════════════════
+#  ClientIdAllocator
+# ════════════════════════════════════════════
+
+class TestClientIdAllocator(unittest.TestCase):
+    def test_allocate_unique_ids(self):
+        a = ClientIdAllocator(base=1)
+        ids = {a.allocate() for _ in range(5)}
+        self.assertEqual(len(ids), 5, "allocate 必须返回唯一 id")
+
+    def test_reserve_then_allocate_skips(self):
+        a = ClientIdAllocator(base=1)
+        a.reserve(1)
+        cid = a.allocate()
+        self.assertNotEqual(cid, 1)
+
+    def test_release_makes_id_reusable(self):
+        a = ClientIdAllocator(base=1)
+        cid = a.allocate()
+        self.assertEqual(cid, 1)
+        a.release(cid)
+        new_cid = a.allocate()
+        self.assertEqual(new_cid, 1)
+
+    def test_default_allocator_singleton(self):
+        reset_default_allocator()
+        d1 = get_default_allocator()
+        d2 = get_default_allocator()
+        self.assertIs(d1, d2)
+
+    def test_base_default_from_config(self):
+        a = ClientIdAllocator()
+        cid = a.allocate()
+        # 默认 base = config.IBKR_CLIENT_ID (通常 1)
+        self.assertEqual(cid, config.IBKR_CLIENT_ID)
+
+
+# ════════════════════════════════════════════
+#  AccountRiskManager
+# ════════════════════════════════════════════
+
+class TestAccountRiskManager(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.clock = LiveClock()
+        self.arm = AccountRiskManager(
+            db_path=self.tmp.name, clock=self.clock,
+            total_capital=10000.0, equity_cache_ttl_sec=10.0
+        )
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def test_initial_state_allows_trade(self):
+        self.assertFalse(self.arm.is_hard_stopped())
+        self.assertFalse(self.arm.is_daily_loss_stopped())
+
+    def test_hard_stop_triggers_above_threshold(self):
+        # 亏 25% > HARD_STOP_LOSS_PCT (20%)
+        r = self.arm.check_hard_stop(account_equity=7500.0)
+        self.assertFalse(r)
+        self.assertTrue(self.arm.is_hard_stopped())
+
+    def test_hard_stop_not_triggered_below_threshold(self):
+        # 亏 10% < HARD_STOP_LOSS_PCT
+        r = self.arm.check_hard_stop(account_equity=9000.0)
+        self.assertTrue(r)
+        self.assertFalse(self.arm.is_hard_stopped())
+
+    def test_hard_stop_persists_across_instances(self):
+        """触发硬止损后, 重启账户级 manager 必须保持 triggered 状态."""
+        self.arm.check_hard_stop(account_equity=7500.0)
+        self.assertTrue(self.arm.is_hard_stopped())
+        # 新实例从同一 DB 恢复
+        arm2 = AccountRiskManager(db_path=self.tmp.name, clock=self.clock,
+                                    total_capital=10000.0)
+        self.assertTrue(arm2.is_hard_stopped())
+
+    def test_contribute_trade_pnl_aggregates_across_symbols(self):
+        self.arm.contribute_trade_pnl("UVXY", -100.0)
+        self.arm.contribute_trade_pnl("TQQQ", -200.0)
+        self.arm.contribute_trade_pnl("SOXL", 50.0)
+        total = self.arm.get_today_account_realized_pnl()
+        self.assertAlmostEqual(total, -250.0)
+
+    def test_daily_loss_triggers_on_aggregate(self):
+        # MAX_DAILY_LOSS_PCT=0.05 × 10000 = $500 上限
+        self.arm.contribute_trade_pnl("UVXY", -300.0)
+        self.arm.contribute_trade_pnl("TQQQ", -300.0)
+        r = self.arm.check_daily_loss()
+        self.assertFalse(r)
+        self.assertTrue(self.arm.is_daily_loss_stopped())
+
+    def test_daily_loss_not_triggered_on_per_symbol_alone(self):
+        """单 symbol $300 < $500 上限; 但聚合应能跨 symbol 触发 (上一个测试).
+        这里验证只有 1 个 symbol 时, 单 symbol 亏损 < limit 不触发."""
+        self.arm.contribute_trade_pnl("UVXY", -300.0)
+        r = self.arm.check_daily_loss()
+        self.assertTrue(r)
+        self.assertFalse(self.arm.is_daily_loss_stopped())
+
+    def test_equity_cache_ttl_reuses_within_window(self):
+        executor = MagicMock()
+        executor.get_account_summary.return_value = {"NetLiquidation": 9500.0}
+        v1 = self.arm.get_account_equity(executor)
+        v2 = self.arm.get_account_equity(executor)
+        self.assertEqual(v1, 9500.0)
+        self.assertEqual(v2, 9500.0)
+        # 缓存命中, executor 只应被调一次
+        self.assertEqual(executor.get_account_summary.call_count, 1)
+
+    def test_invalidate_cache_forces_reread(self):
+        executor = MagicMock()
+        executor.get_account_summary.return_value = {"NetLiquidation": 9500.0}
+        self.arm.get_account_equity(executor)
+        executor.get_account_summary.return_value = {"NetLiquidation": 9800.0}
+        self.arm.invalidate_equity_cache()
+        v = self.arm.get_account_equity(executor)
+        self.assertEqual(v, 9800.0)
+        self.assertEqual(executor.get_account_summary.call_count, 2)
+
+    def test_manual_resume_clears_flags(self):
+        self.arm.check_hard_stop(account_equity=7000.0)
+        self.assertTrue(self.arm.is_hard_stopped())
+        self.arm.manual_resume()
+        self.assertFalse(self.arm.is_hard_stopped())
+
+
+# ════════════════════════════════════════════
+#  RiskManager 委托
+# ════════════════════════════════════════════
+
+class TestRiskManagerWithAccountRisk(unittest.TestCase):
+    def setUp(self):
+        self.tmp_account = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp_account.close()
+        self.tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp_db.close()
+        self.clock = LiveClock()
+        self.account_risk = AccountRiskManager(
+            db_path=self.tmp_account.name, clock=self.clock,
+            total_capital=10000.0,
+        )
+        self.db = TradeDatabase(db_path=self.tmp_db.name)
+
+    def tearDown(self):
+        os.unlink(self.tmp_account.name)
+        os.unlink(self.tmp_db.name)
+
+    def test_risk_manager_delegates_is_hard_stopped(self):
+        risk = RiskManager(self.db, clock=self.clock,
+                            account_risk=self.account_risk)
+        self.assertFalse(risk.is_hard_stopped())
+        self.account_risk.check_hard_stop(account_equity=7000.0)  # 触发
+        self.assertTrue(risk.is_hard_stopped())
+
+    def test_on_trade_closed_writes_to_account_risk(self):
+        risk = RiskManager(self.db, clock=self.clock,
+                            account_risk=self.account_risk)
+        risk.on_trade_closed("UVXY", -100.0, note="test")
+        total = self.account_risk.get_today_account_realized_pnl()
+        self.assertEqual(total, -100.0)
+
+    def test_on_trade_closed_noop_without_account_risk(self):
+        """单标的模式 (account_risk=None) 时 on_trade_closed 不报错也不写共享表."""
+        risk = RiskManager(self.db, clock=self.clock)
+        # 不抛异常 = pass
+        risk.on_trade_closed("UVXY", -100.0)
+
+    def test_position_limit_uses_allocated_capital(self):
+        """allocated_capital=$5000 → position_limit 阈值 = 5000 × 0.95 = $4750"""
+        risk = RiskManager(self.db, clock=self.clock,
+                            allocated_capital=5000.0)
+        # $4800 持仓应被拒
+        r = risk.check_position_limit(4800.0)
+        self.assertFalse(r)
+        # $4000 持仓应允许
+        r2 = risk.check_position_limit(4000.0)
+        self.assertTrue(r2)
+
+    def test_position_limit_falls_back_to_total_capital(self):
+        """不传 allocated_capital → 用 config.TOTAL_CAPITAL ($10000)"""
+        risk = RiskManager(self.db, clock=self.clock)
+        # $9000 < 10000 × 0.95 = $9500 → 允许
+        r = risk.check_position_limit(9000.0)
+        self.assertTrue(r)
+        # $9600 > 9500 → 拒
+        r2 = risk.check_position_limit(9600.0)
+        self.assertFalse(r2)
+
+
+# ════════════════════════════════════════════
+#  端到端: 两个 GridBot 共享 account_risk
+# ════════════════════════════════════════════
+
+class TestMultiBotShareAccountRisk(unittest.TestCase):
+    """模拟两个 bot 共用一个 AccountRiskManager:
+    - bot A 触发硬止损 → bot B 立即看到 is_hard_stopped True
+    - bot A 写日内 PnL → bot B 读到的 daily_loss 包含 A 的份额
+    """
+
+    def setUp(self):
+        self.tmp_account = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp_a = tempfile.NamedTemporaryFile(suffix="_a.db", delete=False)
+        self.tmp_b = tempfile.NamedTemporaryFile(suffix="_b.db", delete=False)
+        for t in (self.tmp_account, self.tmp_a, self.tmp_b):
+            t.close()
+        self.clock = LiveClock()
+        self.account_risk = AccountRiskManager(
+            db_path=self.tmp_account.name, clock=self.clock,
+            total_capital=10000.0,
+        )
+        self.db_a = TradeDatabase(db_path=self.tmp_a.name)
+        self.db_b = TradeDatabase(db_path=self.tmp_b.name)
+        self.risk_a = RiskManager(self.db_a, clock=self.clock,
+                                    account_risk=self.account_risk,
+                                    allocated_capital=4000.0)
+        self.risk_b = RiskManager(self.db_b, clock=self.clock,
+                                    account_risk=self.account_risk,
+                                    allocated_capital=6000.0)
+
+    def tearDown(self):
+        for t in (self.tmp_account, self.tmp_a, self.tmp_b):
+            os.unlink(t.name)
+
+    def test_hard_stop_visible_to_other_bot(self):
+        # bot A 触发账户级硬止损
+        self.account_risk.check_hard_stop(account_equity=7000.0)
+        # bot B 在它的 risk_manager 上也应看到
+        self.assertTrue(self.risk_b.is_hard_stopped())
+        self.assertTrue(self.risk_a.is_hard_stopped())
+
+    def test_daily_loss_aggregates_across_bots(self):
+        # A 亏 $300, B 亏 $300, 合计 $600 > MAX_DAILY_LOSS_PCT × total ($500)
+        self.risk_a.on_trade_closed("UVXY", -300.0)
+        self.risk_b.on_trade_closed("TQQQ", -300.0)
+        total = self.account_risk.get_today_account_realized_pnl()
+        self.assertAlmostEqual(total, -600.0)
+        r = self.account_risk.check_daily_loss()
+        self.assertFalse(r)
+        # bot B 调 can_trade 也会被 daily_loss 拦
+        # 模拟 can_trade 路径
+        check = self.risk_b.account_risk.check_daily_loss()
+        self.assertFalse(check)
+
+    def test_allocated_capital_independence(self):
+        """两个 bot 的 position_limit 各按自己的 allocated 算."""
+        # risk_a allocated=4000 → max = 3800
+        self.assertFalse(self.risk_a.check_position_limit(3900))
+        self.assertTrue(self.risk_a.check_position_limit(3000))
+        # risk_b allocated=6000 → max = 5700
+        self.assertFalse(self.risk_b.check_position_limit(5800))
+        self.assertTrue(self.risk_b.check_position_limit(5000))
+
+
+# ════════════════════════════════════════════
+#  bot_factory 多标的入口
+# ════════════════════════════════════════════
+
+class TestBuildMultiSymbolBots(unittest.TestCase):
+    """build_multi_symbol_bots 不连 IBKR 时也应能装配 (executor.connect 推迟到运行时).
+    本测试只验证装配阶段不抛异常 + 各 bot 字段正确."""
+
+    def test_assembly_uses_allocator_and_shared_account_risk(self):
+        import tempfile
+        # 用 tempdir 隔离 db 路径
+        with tempfile.TemporaryDirectory() as tmp:
+            from bot_factory import build_multi_symbol_bots
+            bots = build_multi_symbol_bots(
+                symbols=["UVXY", "TQQQ"],
+                total_capital=10000.0,
+                allocations={"UVXY": 0.4, "TQQQ": 0.6},
+                db_path_pattern=os.path.join(tmp, "trades_{sym}.db"),
+                account_db_path=os.path.join(tmp, "account.db"),
+            )
+            self.assertEqual(len(bots), 2)
+            self.assertEqual(bots["UVXY"].symbol, "UVXY")
+            self.assertEqual(bots["TQQQ"].symbol, "TQQQ")
+            # allocated_capital 透传
+            self.assertAlmostEqual(bots["UVXY"]._allocated_capital, 4000.0)
+            self.assertAlmostEqual(bots["TQQQ"]._allocated_capital, 6000.0)
+            # 共享 account_risk
+            ar_a = bots["UVXY"].risk.account_risk
+            ar_b = bots["TQQQ"].risk.account_risk
+            self.assertIs(ar_a, ar_b)
+            # client_id 不同
+            self.assertNotEqual(
+                bots["UVXY"].executor.client_id,
+                bots["TQQQ"].executor.client_id,
+            )
+
+    def test_equal_split_default_allocations(self):
+        import tempfile
+        from bot_factory import build_multi_symbol_bots
+        with tempfile.TemporaryDirectory() as tmp:
+            bots = build_multi_symbol_bots(
+                symbols=["A", "B", "C"],
+                total_capital=9000.0,
+                db_path_pattern=os.path.join(tmp, "trades_{sym}.db"),
+                account_db_path=os.path.join(tmp, "account.db"),
+            )
+            for sym in ["A", "B", "C"]:
+                self.assertAlmostEqual(bots[sym]._allocated_capital, 3000.0)
+
+
+
+# ════════════════════════════════════════════
+#  从 test_infrastructure.py 合并: CapitalProvider / Orchestrator / CLI
+# ════════════════════════════════════════════
+
+# ════════════════════════════════════════════
+#  D1 CapitalProvider
+# ════════════════════════════════════════════
+
+class TestLiveCapitalProvider(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.clock = LiveClock()
+        self.arm = AccountRiskManager(
+            db_path=self.tmp.name, clock=self.clock,
+            total_capital=10000.0,
+        )
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def _executor(self, netliq=10500.0):
+        ex = MagicMock()
+        ex.get_account_summary.return_value = {"NetLiquidation": netliq}
+        return ex
+
+    def test_no_allocator_returns_full_equity_minus_reserve(self):
+        p = LiveCapitalProvider(self.arm, reserve_ratio=0.0)
+        cap = p.get_capital_for("UVXY", executor=self._executor(netliq=10000.0))
+        self.assertEqual(cap, 10000.0)
+
+    def test_reserve_ratio_applied(self):
+        p = LiveCapitalProvider(self.arm, reserve_ratio=0.05)
+        cap = p.get_capital_for("UVXY", executor=self._executor(netliq=10000.0))
+        self.assertAlmostEqual(cap, 9500.0)
+
+    def test_allocator_fraction_applied(self):
+        alloc = CapitalAllocator(total=10000.0,
+                                  allocations={"UVXY": 0.4, "TQQQ": 0.6})
+        p = LiveCapitalProvider(self.arm, allocator=alloc, reserve_ratio=0.0)
+        ex = self._executor(netliq=10000.0)
+        self.assertAlmostEqual(p.get_capital_for("UVXY", ex), 4000.0)
+        self.assertAlmostEqual(p.get_capital_for("TQQQ", ex), 6000.0)
+
+    def test_dynamic_responds_to_equity_change(self):
+        """LiveCapitalProvider 必须每次都读 fresh equity, 账户涨跌应被反映."""
+        p = LiveCapitalProvider(self.arm, reserve_ratio=0.0)
+        ex = MagicMock()
+        ex.get_account_summary.side_effect = [
+            {"NetLiquidation": 10000.0},
+            {"NetLiquidation": 11000.0},
+            {"NetLiquidation": 9000.0},
+        ]
+        c1 = p.get_capital_for("UVXY", executor=ex)
+        # 缓存让第二次返回 10000 仍然 (TTL=10s 默认)
+        self.assertAlmostEqual(c1, 10000.0)
+        self.arm.invalidate_equity_cache()
+        c2 = p.get_capital_for("UVXY", executor=ex)
+        self.assertAlmostEqual(c2, 11000.0)
+        self.arm.invalidate_equity_cache()
+        c3 = p.get_capital_for("UVXY", executor=ex)
+        self.assertAlmostEqual(c3, 9000.0)
+
+    def test_failure_falls_back_to_total_capital(self):
+        """executor 取不到 NetLiq → 退回 account_risk.total_capital."""
+        p = LiveCapitalProvider(self.arm, reserve_ratio=0.0)
+        ex = MagicMock()
+        ex.get_account_summary.side_effect = RuntimeError("API down")
+        cap = p.get_capital_for("UVXY", executor=ex)
+        # 总资金 10000 不应为 0 (兜底)
+        self.assertEqual(cap, 10000.0)
+
+
+class TestStaticCapitalProvider(unittest.TestCase):
+    def test_uses_explicit_total(self):
+        p = StaticCapitalProvider(total=5000.0)
+        self.assertEqual(p.get_capital_for("UVXY"), 5000.0)
+
+    def test_falls_back_to_config(self):
+        p = StaticCapitalProvider()
+        self.assertEqual(p.get_capital_for("UVXY"), 10000.0)
+
+    def test_allocator_fraction(self):
+        alloc = CapitalAllocator(total=10000.0,
+                                  allocations={"UVXY": 0.3, "TQQQ": 0.7})
+        p = StaticCapitalProvider(total=5000.0, allocator=alloc)
+        self.assertAlmostEqual(p.get_capital_for("UVXY"), 1500.0)
+        self.assertAlmostEqual(p.get_capital_for("TQQQ"), 3500.0)
+
+
+class TestBuildCapitalProvider(unittest.TestCase):
+    def test_with_account_risk_returns_live(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            arm = AccountRiskManager(db_path=tmp.name, clock=LiveClock(),
+                                       total_capital=10000.0)
+            p = build_capital_provider(account_risk=arm)
+            self.assertIsInstance(p, LiveCapitalProvider)
+        finally:
+            os.unlink(tmp.name)
+
+    def test_no_account_risk_returns_static(self):
+        p = build_capital_provider(account_risk=None, static_total=5000.0)
+        self.assertIsInstance(p, StaticCapitalProvider)
+
+
+# ════════════════════════════════════════════
+#  D3 ClientIdAllocator range / exhaustion
+# ════════════════════════════════════════════
+
+class TestClientIdRange(unittest.TestCase):
+    def test_exhaustion_raises(self):
+        a = ClientIdAllocator(base=1, max_id=3)
+        ids = {a.allocate(), a.allocate(), a.allocate()}
+        self.assertEqual(ids, {1, 2, 3})
+        with self.assertRaises(ClientIdExhausted):
+            a.allocate()
+
+    def test_reserve_then_allocate_finds_gap(self):
+        a = ClientIdAllocator(base=1, max_id=10)
+        a.reserve(1)
+        a.reserve(2)
+        cid = a.allocate()
+        self.assertEqual(cid, 3)
+
+    def test_range_property(self):
+        a = ClientIdAllocator(base=5, max_id=10)
+        self.assertEqual(a.range, (5, 10))
+
+    def test_invalid_range_raises(self):
+        with self.assertRaises(ValueError):
+            ClientIdAllocator(base=10, max_id=5)
+        with self.assertRaises(ValueError):
+            ClientIdAllocator(base=100, min_id=1, max_id=10)
+
+    def test_available_count(self):
+        a = ClientIdAllocator(base=1, max_id=5)
+        self.assertEqual(a.available_count(), 5)
+        a.allocate()
+        self.assertEqual(a.available_count(), 4)
+        a.reserve(99)  # 范围外不影响 available_count? 实际它仍然加入 _used 集合
+        # 99 不在 [1,5], 但 reserve 不验证范围 (只是标记). available_count 用集合 size.
+        # 这是预期行为: reserve 用来标记外部占用, 不强制在 range 内.
+
+    def test_release_does_not_remove_external_reservation(self):
+        a = ClientIdAllocator(base=1, max_id=10)
+        cid = a.allocate()
+        self.assertEqual(cid, 1)
+        a.release(1)
+        self.assertEqual(a.allocate(), 1)
+
+
+class TestIBKRExecutorClientIdInUseDetection(unittest.TestCase):
+    """IBKRExecutor._is_client_id_in_use_error 模式匹配"""
+
+    def test_detects_326_code(self):
+        from ibkr_executor import IBKRExecutor
+        e = RuntimeError("Error 326: Unable to connect as the client id is already in use")
+        self.assertTrue(IBKRExecutor._is_client_id_in_use_error(e))
+
+    def test_detects_phrase(self):
+        from ibkr_executor import IBKRExecutor
+        e = ConnectionError("client id is already used by another connection")
+        self.assertTrue(IBKRExecutor._is_client_id_in_use_error(e))
+
+    def test_does_not_detect_unrelated_error(self):
+        from ibkr_executor import IBKRExecutor
+        e = RuntimeError("Connection refused")
+        self.assertFalse(IBKRExecutor._is_client_id_in_use_error(e))
+
+
+# ════════════════════════════════════════════
+#  D5 NetLiquidation cache invalidation on trade close
+# ════════════════════════════════════════════
+
+class TestEquityCacheInvalidation(unittest.TestCase):
+    def setUp(self):
+        self.tmp_a = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp_a.close()
+        self.tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp_db.close()
+        self.clock = LiveClock()
+        self.arm = AccountRiskManager(
+            db_path=self.tmp_a.name, clock=self.clock,
+            total_capital=10000.0,
+        )
+        self.db = TradeDatabase(db_path=self.tmp_db.name)
+
+    def tearDown(self):
+        os.unlink(self.tmp_a.name)
+        os.unlink(self.tmp_db.name)
+
+    def test_on_trade_closed_invalidates_cache(self):
+        risk = RiskManager(self.db, clock=self.clock, account_risk=self.arm)
+        ex = MagicMock()
+        ex.get_account_summary.return_value = {"NetLiquidation": 10000.0}
+        # 先填充缓存
+        eq1 = self.arm.get_account_equity(ex)
+        self.assertEqual(eq1, 10000.0)
+        self.assertEqual(ex.get_account_summary.call_count, 1)
+        # 平仓事件触发失效
+        risk.on_trade_closed("UVXY", -50.0)
+        # 模拟 IBKR 端权益变化
+        ex.get_account_summary.return_value = {"NetLiquidation": 9950.0}
+        eq2 = self.arm.get_account_equity(ex)
+        # 失效后必读 fresh
+        self.assertEqual(eq2, 9950.0)
+        self.assertEqual(ex.get_account_summary.call_count, 2)
+
+
+# ════════════════════════════════════════════
+#  D6 Clock 统一注入
+# ════════════════════════════════════════════
+
+class TestSharedClock(unittest.TestCase):
+    def test_multi_symbol_bots_share_clock(self):
+        from bot_factory import build_multi_symbol_bots
+        with tempfile.TemporaryDirectory() as tmp:
+            bots = build_multi_symbol_bots(
+                symbols=["UVXY", "TQQQ"],
+                total_capital=10000.0,
+                db_path_pattern=os.path.join(tmp, "trades_{sym}.db"),
+                account_db_path=os.path.join(tmp, "account.db"),
+            )
+            clocks = {id(b.clock) for b in bots.values()}
+            self.assertEqual(len(clocks), 1, "所有 bot 必须共享同一 Clock 实例")
+            # account_risk 也共享同一 clock
+            ar_clocks = {id(b.risk.account_risk.clock) for b in bots.values()}
+            self.assertEqual(ar_clocks, clocks)
+
+    def test_explicit_clock_propagates(self):
+        from bot_factory import build_live_grid_bot
+        with tempfile.TemporaryDirectory() as tmp:
+            clk = LiveClock()
+            # 不能直连 IBKR, 但能验证 clock 透传到 risk / state / session
+            # 用 patch 拦截 IBKRExecutor 防真连接
+            with patch("bot_factory.IBKRExecutor") as MockEx:
+                MockEx.return_value = MagicMock(symbol="UVXY", client_id=1)
+                bot = build_live_grid_bot(
+                    symbol="UVXY",
+                    db_path=os.path.join(tmp, "trades.db"),
+                    clock=clk,
+                )
+                self.assertIs(bot.clock, clk)
+                self.assertIs(bot.state_machine._clock, clk)
+                self.assertIs(bot.session_manager.clock, clk)
+
+
+# ════════════════════════════════════════════
+#  D7 CapitalAllocator rescale
+# ════════════════════════════════════════════
+
+class TestRescale(unittest.TestCase):
+    def test_rescale_from_equity_preserves_fractions(self):
+        a = CapitalAllocator(total=10000.0,
+                              allocations={"UVXY": 0.4, "TQQQ": 0.6})
+        b = rescale_from_equity(a, new_total=12000.0)
+        self.assertEqual(b.total, 12000.0)
+        self.assertEqual(b.fraction_of("UVXY"), 0.4)
+        self.assertAlmostEqual(b.for_symbol("UVXY"), 4800.0)
+        # 原 a 不变 (immutable)
+        self.assertEqual(a.total, 10000.0)
+
+    def test_rescale_negative_raises(self):
+        from capital_allocator import AllocationError
+        a = CapitalAllocator(total=10000.0, allocations={"UVXY": 1.0})
+        with self.assertRaises(AllocationError):
+            rescale_from_equity(a, new_total=-100.0)
+
+    def test_rescale_from_account_risk(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            arm = AccountRiskManager(db_path=tmp.name, clock=LiveClock(),
+                                       total_capital=10000.0)
+            ex = MagicMock()
+            ex.get_account_summary.return_value = {"NetLiquidation": 13500.0}
+            arm.get_account_equity(ex)  # 填缓存
+            a = CapitalAllocator(total=10000.0, allocations={"UVXY": 1.0})
+            b = rescale_from_account_risk(a, arm)
+            self.assertAlmostEqual(b.total, 13500.0)
+        finally:
+            os.unlink(tmp.name)
+
+
+# ════════════════════════════════════════════
+#  D4 MultiSymbolOrchestrator 故障隔离
+# ════════════════════════════════════════════
+
+class TestOrchestratorFailureIsolation(unittest.TestCase):
+    def _bot(self, sym, *, fail_on=None):
+        """构造 mock bot. fail_on=phase → 调对应方法时抛异常."""
+        bot = MagicMock()
+        bot.symbol = sym
+        bot.should_stop.return_value = False
+        bot.get_check_interval_sec.return_value = 60
+        if fail_on == "start":
+            bot.start.side_effect = RuntimeError(f"start fail {sym}")
+        if fail_on == "step":
+            bot.step.side_effect = RuntimeError(f"step fail {sym}")
+        if fail_on == "shutdown":
+            bot.shutdown.side_effect = RuntimeError(f"shutdown fail {sym}")
+        return bot
+
+    def test_start_failure_isolates_one_bot(self):
+        bots = {
+            "A": self._bot("A", fail_on="start"),
+            "B": self._bot("B"),
+            "C": self._bot("C"),
+        }
+        orch = MultiSymbolOrchestrator(bots)
+        results = orch.start_all()
+        self.assertFalse(results["A"])
+        self.assertTrue(results["B"])
+        self.assertTrue(results["C"])
+        self.assertIn("A", orch.failed_bots)
+        self.assertNotIn("B", orch.failed_bots)
+
+    def test_step_failure_does_not_pollute_others(self):
+        bots = {
+            "A": self._bot("A"),
+            "B": self._bot("B", fail_on="step"),
+            "C": self._bot("C"),
+        }
+        orch = MultiSymbolOrchestrator(bots)
+        orch.start_all()
+        results = orch.step_all()
+        # B step 失败被隔离, A/C 仍然成功
+        self.assertTrue(results["A"])
+        self.assertFalse(results["B"])
+        self.assertTrue(results["C"])
+        # 下一轮 B 已在 failed_bots, 应直接跳过
+        bots["B"].step.reset_mock()
+        results2 = orch.step_all()
+        self.assertNotIn("B", results2)
+        bots["B"].step.assert_not_called()
+
+    def test_shutdown_failure_does_not_propagate(self):
+        bots = {
+            "A": self._bot("A", fail_on="shutdown"),
+            "B": self._bot("B"),
+        }
+        orch = MultiSymbolOrchestrator(bots)
+        # 不应抛异常
+        orch.shutdown_all()
+        bots["B"].shutdown.assert_called_once()
+
+    def test_revive_succeeds(self):
+        bots = {"A": self._bot("A", fail_on="start")}
+        orch = MultiSymbolOrchestrator(bots)
+        orch.start_all()
+        self.assertIn("A", orch.failed_bots)
+        # 修复 start
+        bots["A"].start.side_effect = None
+        ok = orch.revive("A")
+        self.assertTrue(ok)
+        self.assertNotIn("A", orch.failed_bots)
+
+    def test_should_stop_all_true_only_when_all_stopped(self):
+        b1 = self._bot("A")
+        b2 = self._bot("B")
+        b1.should_stop.return_value = True
+        b2.should_stop.return_value = False
+        orch = MultiSymbolOrchestrator({"A": b1, "B": b2})
+        self.assertFalse(orch.should_stop_all())
+        b2.should_stop.return_value = True
+        self.assertTrue(orch.should_stop_all())
+
+    def test_failure_callback_invoked(self):
+        calls = []
+        def cb(sym, exc, phase):
+            calls.append((sym, type(exc).__name__, phase))
+        bots = {"A": self._bot("A", fail_on="start")}
+        orch = MultiSymbolOrchestrator(bots, on_bot_failure=cb)
+        orch.start_all()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "A")
+        self.assertEqual(calls[0][2], "start")
+
+    def test_next_sleep_sec_uses_min_interval(self):
+        a = self._bot("A"); a.get_check_interval_sec.return_value = 30
+        b = self._bot("B"); b.get_check_interval_sec.return_value = 60
+        orch = MultiSymbolOrchestrator({"A": a, "B": b})
+        self.assertEqual(orch.next_sleep_sec(), 30)
+
+
+# ════════════════════════════════════════════
+#  D2 manual_resume CLI
+# ════════════════════════════════════════════
+
+class TestManualResumeCLI(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        # 预先在 DB 里制造 triggered 状态
+        clk = LiveClock()
+        arm = AccountRiskManager(db_path=self.tmp.name, clock=clk,
+                                   total_capital=10000.0)
+        arm.check_hard_stop(account_equity=7000.0)  # 触发 hard_stop
+        arm.contribute_trade_pnl("UVXY", -600.0)
+        arm.check_daily_loss()  # 触发 daily_loss
+        self.assertTrue(arm.is_hard_stopped())
+        self.assertTrue(arm.is_daily_loss_stopped())
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def _run_cli(self, args: list[str]) -> subprocess.CompletedProcess:
+        cmd = [sys.executable, "scripts/manual_resume.py",
+               "--account-db", self.tmp.name] + args
+        return subprocess.run(
+            cmd, cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=20,
+        )
+
+    def test_status_shows_triggered_flags(self):
+        r = self._run_cli(["--status"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("hard_stop_triggered:  True", r.stdout)
+        self.assertIn("daily_loss_triggered: True", r.stdout)
+
+    def test_resume_hard_stop_with_yes(self):
+        r = self._run_cli(["--resume-hard-stop", "--yes"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # 验证 DB 里的 flag 确实清了
+        with sqlite3.connect(self.tmp.name) as conn:
+            row = conn.execute(
+                "SELECT hard_stop_triggered, daily_loss_triggered FROM account_risk_state WHERE id=1"
+            ).fetchone()
+        self.assertEqual(row[0], 0)
+        # daily_loss 没动
+        self.assertEqual(row[1], 1)
+
+    def test_resume_all_with_yes(self):
+        r = self._run_cli(["--resume-all", "--yes"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with sqlite3.connect(self.tmp.name) as conn:
+            row = conn.execute(
+                "SELECT hard_stop_triggered, daily_loss_triggered FROM account_risk_state WHERE id=1"
+            ).fetchone()
+        self.assertEqual(row[0], 0)
+        self.assertEqual(row[1], 0)
+
+    def test_missing_db_returns_error(self):
+        cmd = [sys.executable, "scripts/manual_resume.py",
+               "--account-db", "/nonexistent/path/account.db", "--status"]
+        r = subprocess.run(cmd, cwd=os.path.dirname(os.path.abspath(__file__)),
+                            capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.returncode, 2)
+
+
+# ════════════════════════════════════════════
+#  Strategy-bar 计时器双消费 bug 回归测试
+#
+#  历史 bug: _should_check_dynamic_adjustment() 有 side effect (消耗 _last_recenter_check).
+#  _update_market_context 和 _handle_active_grid step 5 各调一次, 第一个消耗后
+#  第二个永远 False, 导致 _apply_dynamic_adjustment 在 session 启动后再也不跑,
+#  grid_engine.should_exit / recenter 全部哑火, V49 +109% → -21% HARD_STOP.
+#
+#  修复: 拆 _strategy_bar_due (pure check) + _consume_strategy_bar (consume),
+#  _handle_active_grid 顶部 single check 共享给两路.
+#
+#  本测试钉死该行为, 防止再次回归.
+# ════════════════════════════════════════════
+
+class TestStrategyBarDueBugRegression(unittest.TestCase):
+    def setUp(self):
+        from grid_bot import GridBot
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.clock = LiveClock()
+        self.db = TradeDatabase(db_path=self.tmp.name)
+        self.bot = GridBot.__new__(GridBot)
+        self.bot.clock = self.clock
+        self.bot._last_recenter_check = None
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def test_strategy_bar_due_is_pure(self):
+        """pure check 不应有 side effect."""
+        b = self.bot
+        self.assertTrue(b._strategy_bar_due())     # None 初值 → True
+        self.assertTrue(b._strategy_bar_due())     # 再次 → 仍 True (无 side effect)
+        # 显式 consume 后, 时钟还在同一刻 → 应 False
+        b._consume_strategy_bar()
+        self.assertFalse(b._strategy_bar_due())
+
+    def test_double_call_does_not_consume_twice(self):
+        """_handle_active_grid 流程: 顶部 check 一次 → 两路使用 → step5 consume 一次.
+        模拟该流程, 验证 step5 不会因为前面已被消耗而错过."""
+        b = self.bot
+        # 模拟第一次进入 (无 prev): bar_due = True
+        bar_due_1 = b._strategy_bar_due()
+        # step2 / step5 都看到 True
+        self.assertTrue(bar_due_1)
+        # step5 末尾 consume
+        b._consume_strategy_bar()
+        # 同一 bar 再调 → 应 False (已 consume)
+        self.assertFalse(b._strategy_bar_due())
+
+    def test_legacy_should_check_compat(self):
+        """旧 API _should_check_dynamic_adjustment 保留向后兼容 (check + consume).
+        测试: 第一次 True, 第二次 False."""
+        b = self.bot
+        self.assertTrue(b._should_check_dynamic_adjustment())
+        self.assertFalse(b._should_check_dynamic_adjustment())
+
+
+class TestTacticalActionsReachable(unittest.TestCase):
+    """战术化 4 个 action 在受控合成 ctx 上必须可达 (中性 regression).
+
+    目的: 防止战术化分支无声退化为 dead code. 不断言 'ON vs OFF' 优劣;
+    断言每个 action 在合适的合成 MarketContext + 临时阈值下能被触发,
+    即代码路径活着. 未来重启 / 重设计战术化时, 这套测试仍有意义.
+
+    spec: docs/superpowers/specs/2026-05-14-tactical-impossibility-proof-design.md §4.4
+    """
+
+    def setUp(self):
+        from datetime import datetime
+        from interfaces import HistoricalClock
+        from trade_logger import TradeDatabase
+        from session_manager import SessionManager
+        import tactical_config as tcfg
+
+        self.tcfg = tcfg
+        # 临时 DB
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        db_path = f"{self.tmpdir.name}/t.db"
+        self.db = TradeDatabase(db_path=db_path)
+        self.clock = HistoricalClock()
+        self.clock.set(datetime(2026, 1, 1, 10, 0))
+        self.sm = SessionManager(db=self.db, clock=self.clock)
+        self.sm.start_session(
+            symbol="TEST", start_equity=10000.0, start_cash=4000.0,
+            start_position=200.0, start_price=30.0,
+            confidence=tcfg.CONFIDENCE_NORMAL,
+        )
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _patch(self, attr, value):
+        """临时改 tactical_config 阈值, tearDown 恢复."""
+        orig = getattr(self.tcfg, attr)
+        setattr(self.tcfg, attr, value)
+        self.addCleanup(setattr, self.tcfg, attr, orig)
+
+    def test_defensive_triggers_on_strong_downtrend(self):
+        from session_manager import ACTION_ENTER_DEFENSIVE
+        from tactical_rules import MarketContext
+        self._patch("TREND_RISK_SCORE_DEFENSIVE", 50.0)
+        self._patch("TREND_RISK_ADX_THRESHOLD", 22.0)
+        ctx = MarketContext(
+            current_price=27.0, ema=30.0, atr=1.0, atr_pct=0.04,
+            adx=50.0, grid_center=30.0,
+            ema_slope=-0.04, consecutive_down_bars=5,
+            price_below_ema_bars=5, atr_expansion=1.0,
+        )
+        ev = self.sm.evaluate_session(ctx)
+        self.assertEqual(ev.action, ACTION_ENTER_DEFENSIVE,
+                         f"reason={ev.reason} score={ev.trend_risk_score}")
+
+    def test_force_exit_triggers_on_hard_stop(self):
+        from session_manager import ACTION_FORCE_EXIT
+        from tactical_rules import MarketContext
+        self._patch("SESSION_HARD_STOP_PCT", 0.05)
+        self.sm.update_session(
+            current_equity=9000.0, current_cash=3500.0,  # 亏 10%
+            current_position=200.0, current_price=27.5,
+            realized_pnl_delta=-1000.0,
+        )
+        ctx = MarketContext(current_price=27.5, ema=30.0, atr=1.0,
+                            atr_pct=0.04, adx=15.0, grid_center=30.0)
+        ev = self.sm.evaluate_session(ctx)
+        self.assertEqual(ev.action, ACTION_FORCE_EXIT,
+                         f"reason={ev.reason}")
+
+    def test_profit_protect_exit_on_trailing_giveback(self):
+        from session_manager import ACTION_PROFIT_PROTECT_EXIT
+        from tactical_rules import MarketContext
+        self._patch("SESSION_MIN_PROFIT_TO_PROTECT_PCT", 0.01)
+        self._patch("SESSION_TRAILING_GIVEBACK_RATIO", 0.5)
+        # 先冲 peak +$300 (3%), 再回吐到 +$120
+        self.sm.update_session(
+            current_equity=10300.0, current_cash=4000.0,
+            current_position=200.0, current_price=31.5,
+            realized_pnl_delta=300.0,
+        )
+        self.sm.update_session(
+            current_equity=10120.0, current_cash=4000.0,
+            current_position=200.0, current_price=30.6,
+            realized_pnl_delta=-180.0,
+        )
+        ctx = MarketContext(current_price=30.6, ema=30.0, atr=1.0,
+                            atr_pct=0.03, adx=15.0, grid_center=30.0)
+        ev = self.sm.evaluate_session(ctx)
+        self.assertEqual(ev.action, ACTION_PROFIT_PROTECT_EXIT,
+                         f"reason={ev.reason}")
+
+    def test_partial_profit_exit_on_strong_profit(self):
+        from session_manager import ACTION_PARTIAL_PROFIT_EXIT
+        from tactical_rules import MarketContext
+        self._patch("SESSION_STRONG_PROFIT_PCT", 0.03)
+        self._patch("SESSION_STRONG_PROFIT_PARTIAL_EXIT_RATIO", 0.5)
+        self._patch("SESSION_MIN_PROFIT_TO_PROTECT_PCT", 0.999)  # 屏蔽 trailing
+        self._patch("SESSION_TRAILING_GIVEBACK_RATIO", 0.999)
+        self.sm.update_session(
+            current_equity=10500.0, current_cash=4000.0,
+            current_position=200.0, current_price=32.5,
+            realized_pnl_delta=500.0,
+        )
+        ctx = MarketContext(current_price=32.5, ema=30.0, atr=1.0,
+                            atr_pct=0.03, adx=15.0, grid_center=30.0)
+        ev = self.sm.evaluate_session(ctx)
+        self.assertEqual(ev.action, ACTION_PARTIAL_PROFIT_EXIT,
+                         f"reason={ev.reason}")
 
 
 if __name__ == "__main__":

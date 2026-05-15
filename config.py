@@ -96,7 +96,9 @@ def ibkr_port_label(port: int) -> tuple[str, str]:
 #  但保留 env 覆盖 (TACTICAL_GRID_ENABLED=0 仍能精细关闭仅战术层).
 # ════════════════════════════════════════════
 import os as _os
-TURBO_ENABLED: bool = _os.getenv("TURBO_ENABLED", "1").strip().lower() in (
+# 默认 OFF — 2026-05-15 严证伪通过, 详见 reports/tactical_proof_of_impossibility.md
+# 战术化代码全部保留 (EXPERIMENTAL); 实盘 / 回测默认走 V49 legacy 路径.
+TURBO_ENABLED: bool = _os.getenv("TURBO_ENABLED", "0").strip().lower() in (
     "1", "true", "yes", "y", "on"
 )
 
