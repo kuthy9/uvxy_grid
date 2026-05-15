@@ -44,11 +44,11 @@ SINGLE_DIM_KNOBS: dict[str, list] = {
     "SESSION_NO_FILL_TIMEOUT_BARS": [0, 12, 24, 48, 96],
 }
 
-# 联合 sweep fallback 轴 (spec §3 Part 3 fallback)
+# 联合 sweep fallback 轴 (spec §3 Part 3 fallback) — 每轴 ≤ 3 值 → 最大 3×2×3×3=54 trial
 JOINT_AXES_FALLBACK: list[tuple[str, list]] = [
-    ("SESSION_MAX_AGE_BARS", [12, 20, 30, 60, 99999]),
+    ("SESSION_MAX_AGE_BARS", [12, 30, 99999]),
     ("TACTICAL_OVERRIDE_GRID_ENGINE_EXIT", [0, 1]),
-    ("TREND_RISK_SCORE_DEFENSIVE", [50.0, 60.0, 70.0, 999.0]),
+    ("TREND_RISK_SCORE_DEFENSIVE", [50.0, 70.0, 999.0]),
     ("SESSION_HARD_STOP_PCT", [0.05, 0.10, 0.20]),
 ]
 
@@ -254,12 +254,16 @@ def _select_joint_axes_from_single_dim(args) -> list[tuple[str, list]] | None:
         print("[info] 所有 knob 得分 < 0.1, 走 fallback 轴")
         return None
 
-    # 从 SINGLE_DIM_KNOBS 取该轴的取值表, 限制 ≤ 5 个值
+    # 从 SINGLE_DIM_KNOBS 取该轴的取值表, 限制 ≤ 3 值 (首/中/尾), 避免 5^4=625 trial 超规模
+    def _downsample_to_three(vals: list) -> list:
+        """从 vals 取 3 个: 首, 中, 尾. 长度 ≤ 3 时原样返回."""
+        if len(vals) <= 3:
+            return list(vals)
+        return [vals[0], vals[len(vals) // 2], vals[-1]]
+
     axes: list[tuple[str, list]] = []
     for knob, _ in ranked:
-        vals = SINGLE_DIM_KNOBS.get(knob, [])
-        if len(vals) > 5:
-            vals = vals[:5]
+        vals = _downsample_to_three(SINGLE_DIM_KNOBS.get(knob, []))
         axes.append((knob, vals))
     return axes
 
