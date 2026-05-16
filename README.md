@@ -163,16 +163,16 @@ docker compose up -d
   - VXX  ~5y 4h CSV (Alpaca IEX, 2021-05-17 → 2026-05-14)
 - **支持的策略周期**: `15m` / `1h` / `4h` / `1d` (改 `config.STRATEGY_INTERVAL` 即可)
 - **当前 5y 回测指标 ($10,000 capital, 真实化撮合)**:
-  - **多标的合并 (UVXY+VXX 50/50)**: ret **+201.69%** / annu +25.07% / MDD 17.35%
-  - UVXY sub-bot ($5,000): ret +76.46%
-  - VXX  sub-bot ($5,000): ret +326.92%
+  - **多标的合并 (UVXY+VXX 50/50)**: ret **+153.93%** / annu +20.78% / MDD ~15.09%
+  - UVXY sub-bot ($5,000): ret +70.38% / final $8,519.16
+  - VXX  sub-bot ($5,000): ret +237.48% / final $16,873.86
 - **单标的参考** (回测 + sanity, 不是实盘默认):
   - UVXY: +82.81% / 年化 +12.05% / MDD 15.86%
   - VXX: +226.79% / 年化 +26.78% / MDD 15.17%
 - **战术化已 archived** (2026-05-15 严证伪通过): 详见
   [`archive/tactical/reports/tactical_proof_of_impossibility.md`](./archive/tactical/reports/tactical_proof_of_impossibility.md)
 - **测试覆盖**: 252 个 `test_*` 用例 (含 ~51 个 tactical-related skipped)
-- **历史 baseline**: D5 报告 +153.93% (2026-05-15 早期 VXX 数据快照, 现 VXX 延至 5/14 后实测 +201.69%)
+- **历史 baseline**: D5 spec baseline +153.93% (matches D5 report exactly; grid_capital 2x oversubscription bug fixed in commit 0b1abcf → bit-identical reproducibility)
 
 ---
 

@@ -12,7 +12,7 @@ All notable changes to this project will be documented in this file.
 - 战术化 runtime data: `tactical_proof/`, `tactical_extended/` (gitignored)
 
 ### Added
-- 多标的并行回测: `scripts/run_multi_backtest.py` (UVXY+VXX 50/50, +201.69% 5y)
+- 多标的并行回测: `scripts/run_multi_backtest.py` (UVXY+VXX 50/50, +153.93% 5y)
 - Walk-forward 验证: `scripts/walk_forward_fixed.py`
 - VXX 5y 数据: `data/vxx_4h.csv`
 - main.py `MultiSymbolOrchestrator` 入口 + `--paper-verify` flag
@@ -33,6 +33,12 @@ All notable changes to this project will be documented in this file.
 - `entry_filter.py` L193: 删 dead `getattr` fallback `-1.0`
 - `config.py`: 加 `ENTRY_MAX_ADX_SLOPE = -0.5` (撤销到 8c41c62 后丢失), 删 stale "默认改 -1000" 注释
 - `state_machine.py`: 补 commit T2 6-state FSM (b388f7b 漏 stage)
+- `grid_bot.py:738` DynamicGridEngine() 未传 grid_capital, multi-symbol sub-bot 2x
+  oversubscribe (因 fallback 用全账户 TOTAL_CAPITAL × GRID_CAPITAL_RATIO 而非
+  本 bot allocated × ratio). Live + backtest 实测影响. 修后 multi 从 +201.69%
+  (inflated) 恢复为 +153.93% (正确, 与 D5 baseline bit-identical). (commit 0b1abcf)
+- `ibkr_executor.py.__init__`: 加 4 个 kwargs (symbol/exchange/currency/client_id),
+  bot_factory 装配 live bot 时不再 TypeError.
 
 ### Investigated (Not Fixed, Follow-up)
 - V49 (`4fdb801`) → `8c41c62` 之间 -27pp 回归 root cause (first bad = `e369447`,

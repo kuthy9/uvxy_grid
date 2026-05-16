@@ -166,24 +166,26 @@
 | T3+T4 | b388f7b + c053d8c | surgical revert 11 tracked file + GridBot allocated_capital re-apply (4.E) + state_machine 补 commit |
 | T3+T4 quality | 92bf96a | symbol property + stale comments + ADX slope doc cleanup |
 | T6 | 61ca298 + 11cfb72 | risk_manager _capital_reference (4.A) + check_daily_loss delegation gap |
-| T5 | (verify) | Phase 3 Gate PASS: multi-symbol +201.69% (D5 baseline +153.93% 超过, 因 VXX 数据增长) |
+| T5 | (verify) | Phase 3 Gate PASS: multi-symbol +153.93% (与 D5 baseline bit-identical, 修 grid_capital 2x bug 后) |
 | T7 | db7a4ea | entry_filter getattr + config stale comment cleanup (4.B+4.C) |
 | T8 | 78fa845 | V49 -27pp git-bisect 报告 (first bad e369447, 未修, 4.D) |
 | T9 | 44df6f2 | main.py MultiSymbolOrchestrator + --paper-verify |
 | T10 | cbdb210 | grep cleanup, 修 grid_engine.py 3 处 wall-clock 违规 |
 | T11 | (verify) | tests + backtest + smoke 全 PASS |
 | T12 | (本次) | README + CHANGELOG + report + findings F10 + progress |
+| T-CRITICAL | 0b1abcf | final review 发现 grid_capital 2x oversubscribe + IBKRExecutor signature, 修 |
+| T-DOCS-FIX | (本次) | 文档更新 +201.69% → +153.93% (真实 baseline) |
 
 ### 主要数据
 - Single UVXY: +82.81% / 年化 +12.05% / MDD 15.86%
 - Single VXX: +226.79% / 年化 +26.78% / MDD 15.17%
-- **多标的 5y +201.69%** (D5 +153.93% baseline 超过, 因 VXX 数据自然延长 5 个月)
-- UVXY sub +76.46% / VXX sub +326.92%
+- **多标的 5y +153.93%** (D5 baseline 精确复现, 修 grid_capital 2x bug 后; 年化 +20.78%, 最终权益 $25,393.02)
+- UVXY sub +70.38% (final $8,519.16) / VXX sub +237.48% (final $16,873.86)
 - test.py: 252 tests, 2 fails + 27 errors + 51 skipped (sequencing 残留, 无回归)
 - Paper-verify smoke: OK
 
 ### 整体 Verdict
-生产重构完整闭环. 主路径干净 (0 tactical import, 0 ib_insync 外泄, 0 wall-clock 业务模块违规), 多标的能力保留 (+201.69% 复现), 6 bug 修复 + 1 定位 follow-up.
+生产重构完整闭环. 主路径干净 (0 tactical import, 0 ib_insync 外泄, 0 wall-clock 业务模块违规), 多标的能力保留 (+153.93% 复现, D5 baseline bit-identical), 6 bug 修复 + 1 定位 follow-up + 2 final-review critical 修复 (grid_capital 2x + IBKRExecutor signature).
 
 ### 测试状态
 252 tests: 2 fails + 27 errors (T2/T3 sequencing 残留, 见 reports/refactor_2026_05_15.md §6).

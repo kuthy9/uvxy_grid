@@ -312,7 +312,7 @@ Gate 矩阵:
 - 战术化 archived 到 archive/tactical/ (3 模块 + 3 sweep 工具 + tests + reports)
 - 11 tracked file 撤销到 `8c41c62`, 然后选择性 re-apply (risk_manager 4.A / grid_bot 4.E / config 4.C / entry_filter 4.B / main.py Phase 5)
 - main.py 默认 MultiSymbolOrchestrator (UVXY+VXX 50/50)
-- 多标的 5y +201.69% 复现 (D5 +153.93% 是 VXX 数据快照, 后增长 → +201.69%, 不是 hardcode)
+- 多标的 5y +153.93% (D5 baseline 精确复现, 修 grid_capital 2x bug 后从 inflated +201.69% 恢复为正确值)
 
 ### 修复的 5 个 bug (+ 1 plan-discovered + 1 Phase-6-discovered)
 - 4.A risk_manager multi-symbol capital reference (D5 发现, re-applied + check_daily_loss delegation gap 补)
