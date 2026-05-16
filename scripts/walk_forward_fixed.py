@@ -116,7 +116,7 @@ def main():
             "annualized_pct": stats.annualized_return_pct,
             "sharpe": stats.sharpe_ratio,
             "mdd_pct": stats.max_drawdown_pct,
-            "sessions": stats.session_count,
+            "sessions": stats.total_grid_sessions,
             "valid_ret_positive": bool(stats.total_return_pct > 0),
         }
         results.append(row)
