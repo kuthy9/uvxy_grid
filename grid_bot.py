@@ -106,6 +106,10 @@ class GridBot:
         # 时自动回 SCANNING, 避免 waiting_entry 长期卡死.
         self._entry_execution_failures = 0
 
+    @property
+    def symbol(self) -> str:
+        return self._symbol
+
     def _capital(self) -> float:
         """返回本 bot 的资金参考. 多标的传 allocated_capital, 单标的 fallback TOTAL_CAPITAL.
 
@@ -153,7 +157,7 @@ class GridBot:
         except Exception as e:
             logger.error(f"StateMachine 恢复失败: {e}")
 
-        # GridEngine 恢复 (仅当之前处于 ACTIVE_GRID / EXIT_PENDING)
+        # GridEngine 恢复 (仅当之前处于 grid states / EXIT_PENDING)
         self._try_restore_grid()
 
         # _base_position_shares 恢复
@@ -181,7 +185,7 @@ class GridBot:
         logger.info(f"🚀 进入主循环 | 状态={self.state_machine.state.value}")
 
     def _try_restore_grid(self):
-        """当状态机处于 ACTIVE_GRID / EXIT_PENDING 时, 尝试从快照恢复网格引擎."""
+        """当状态机处于 grid states (OFFENSIVE/DEFENSIVE/ACTIVE) / EXIT_PENDING 时, 尝试从快照恢复网格引擎."""
         state = self.state_machine.state
         if not (is_grid_state(state) or state == SystemState.EXIT_PENDING):
             return
@@ -789,7 +793,7 @@ class GridBot:
         )
 
     # ───────────────────────────────
-    #  ACTIVE_GRID
+    #  grid states (OFFENSIVE / DEFENSIVE / ACTIVE)
     # ───────────────────────────────
 
     def _handle_active_grid(self):

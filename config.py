@@ -179,7 +179,8 @@ ENTRY_PRICE_BAND_ATR = float(os.getenv("ENTRY_PRICE_BAND_ATR", "1.25"))
 # 实盘观察后若发现 timing 命中比例过低可调大. 可通过环境变量覆盖.
 # ADX 斜率过滤 (entry_filter.py T1 增强, 2026-05-15 Phase 4.E 补回):
 # 拒绝 ADX 斜率 > 阈值 的入场 (ADX 正在上升意味着趋势形成中, 不利于网格).
-# 5y 实测: -1.0=+0.28%(过严, 几乎没 session), -0.5=+82.81%(最优), 关闭=+68.75%.
+# 调参证据 (data/uvxy_4h.csv, --capital 10000, full 5y, 2026-05-15):
+#   关闭=+68.75%, -1.0=+0.28%(过严, 几乎没 session), -0.5=+82.81%(最优).
 # 设为 -1000 可关闭. 不在 config 中定义此参数时, entry_filter 默认 -1.0 (过严!).
 ENTRY_ADX_SLOPE_LOOKBACK_BARS = int(os.getenv("ENTRY_ADX_SLOPE_LOOKBACK_BARS", "3"))
 ENTRY_MAX_ADX_SLOPE = float(os.getenv("ENTRY_MAX_ADX_SLOPE", "-0.5"))

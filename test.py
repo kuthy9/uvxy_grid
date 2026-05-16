@@ -1327,7 +1327,7 @@ class TestExecuteEntryPriceUnavailable(unittest.TestCase):
     def test_no_price_skips_order_and_logs_event(self):
         from grid_bot import GridBot
         bot = GridBot.__new__(GridBot)
-        bot.symbol = config.SYMBOL  # __new__-style 测试: 必须显式设
+        bot._symbol = config.SYMBOL  # __new__-style 测试: 必须显式设
         bot.executor = MagicMock()
         bot.executor.get_current_price.return_value = None
         bot.executor.is_connected.return_value = True
@@ -1364,7 +1364,7 @@ class TestScanningImmediatelyHandsOffToWaiting(unittest.TestCase):
         # 起点: SCANNING
 
         bot = GridBot.__new__(GridBot)
-        bot.symbol = config.SYMBOL  # __new__-style 测试: 必须显式设
+        bot._symbol = config.SYMBOL  # __new__-style 测试: 必须显式设
         bot.clock = clock
         bot.state_machine = sm
         bot.db = MagicMock()
@@ -1440,7 +1440,7 @@ class TestWaitingEntryAutoReset(unittest.TestCase):
                          "测试 fixture", now=clock.now())
 
         bot = GridBot.__new__(GridBot)
-        bot.symbol = config.SYMBOL  # __new__-style 测试: 必须显式设
+        bot._symbol = config.SYMBOL  # __new__-style 测试: 必须显式设
         bot.clock = clock
         bot.state_machine = sm
         bot.db = MagicMock()
@@ -1624,7 +1624,7 @@ class TestDailySnapshotWriting(unittest.TestCase):
         sm = StateMachine(clock=clock)
 
         bot = GridBot.__new__(GridBot)
-        bot.symbol = config.SYMBOL  # __new__-style 测试: 必须显式设
+        bot._symbol = config.SYMBOL  # __new__-style 测试: 必须显式设
         bot.clock = clock
         bot.state_machine = sm
         bot.db = MagicMock()
@@ -2298,7 +2298,7 @@ class TestGridBotRecenterRespect(unittest.TestCase):
         grid.recenter = MagicMock()
 
         bot = GridBot.__new__(GridBot)
-        bot.symbol = "UVXY"
+        bot._symbol = "UVXY"
         bot.clock = clock
         bot.executor = MagicMock()
         bot.db = db
@@ -2409,7 +2409,7 @@ class TestTacticalExitOverride(unittest.TestCase):
         grid.recenter = MagicMock()
 
         bot = GridBot.__new__(GridBot)
-        bot.symbol = "UVXY"
+        bot._symbol = "UVXY"
         bot.clock = clock
         bot.executor = MagicMock()
         bot.db = db
@@ -2521,7 +2521,7 @@ class TestTacticalBaseZeroEntry(unittest.TestCase):
         executor.place_market_order = MagicMock()
 
         bot = GridBot.__new__(GridBot)
-        bot.symbol = "UVXY"
+        bot._symbol = "UVXY"
         bot.clock = clock
         bot.executor = executor
         bot.db = db
@@ -2923,7 +2923,7 @@ class TestGridBotDefensiveBlocksBuy(unittest.TestCase):
         sm = SessionManager(db=db, clock=clock)
 
         bot = GridBot.__new__(GridBot)
-        bot.symbol = config.SYMBOL
+        bot._symbol = config.SYMBOL
         bot.clock = clock
         bot.executor = MagicMock()
         bot.db = db
@@ -3034,7 +3034,7 @@ class TestSoftStopTriggersDefensive(unittest.TestCase):
             sm = SessionManager(db=db, clock=clock)
 
             bot = GridBot.__new__(GridBot)
-            bot.symbol = config.SYMBOL
+            bot._symbol = config.SYMBOL
             bot.clock = clock
             bot.executor = MagicMock()
             bot.db = db
@@ -3108,7 +3108,7 @@ class TestHardStopTriggersExit(unittest.TestCase):
             sm = SessionManager(db=db, clock=clock)
 
             bot = GridBot.__new__(GridBot)
-            bot.symbol = config.SYMBOL
+            bot._symbol = config.SYMBOL
             bot.clock = clock
             bot.executor = MagicMock()
             bot.db = db
@@ -3162,10 +3162,10 @@ class TestMultiSymbolParameterization(unittest.TestCase):
         executor = MagicMock()
         executor.symbol = "TQQQ"  # executor 优先级最高
         bot = GridBot.__new__(GridBot)
-        bot.symbol = None
-        # 直接走 __init__ 逻辑里 self.symbol = symbol or executor.symbol or config.SYMBOL
+        bot._symbol = None
+        # 直接走 __init__ 逻辑里 self._symbol = symbol or executor.symbol or config.SYMBOL
         # 但这里用 __new__ 跳过 __init__, 手动重现
-        bot.symbol = "SOXL" or executor.symbol or config.SYMBOL
+        bot._symbol = "SOXL" or executor.symbol or config.SYMBOL
         self.assertEqual(bot.symbol, "SOXL")
 
     def _tempfile_db(self):
@@ -3964,7 +3964,7 @@ class TestOrchestratorFailureIsolation(unittest.TestCase):
     def _bot(self, sym, *, fail_on=None):
         """构造 mock bot. fail_on=phase → 调对应方法时抛异常."""
         bot = MagicMock()
-        bot.symbol = sym
+        bot._symbol = sym
         bot.should_stop.return_value = False
         bot.get_check_interval_sec.return_value = 60
         if fail_on == "start":
