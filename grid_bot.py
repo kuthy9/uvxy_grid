@@ -90,7 +90,7 @@ class GridBot:
         self.data_fetcher = data_fetcher  # 需要有 get_strategy_data(symbol, days)
         self.strategy_df_days = strategy_df_days or config.HISTORY_LOOKBACK_DAYS
         self._allocated_capital = allocated_capital
-        self._symbol = symbol or config.SYMBOL
+        self._symbol = symbol or getattr(executor, 'symbol', None) or config.SYMBOL
         self._capital_provider = capital_provider  # 现阶段未实际使用, 仅 signature 兼容
 
         self.grid: Optional[DynamicGridEngine] = None

@@ -55,7 +55,8 @@ class SimulatedExecutor(Executor):
 
     def __init__(self, df: pd.DataFrame, initial_cash: float, clock,
                  realistic: Optional[bool] = None,
-                 seed: Optional[int] = None):
+                 seed: Optional[int] = None,
+                 symbol: Optional[str] = None):
         self.df = df.sort_index().copy()
         self.initial_cash = initial_cash
         self.cash = initial_cash
@@ -63,6 +64,7 @@ class SimulatedExecutor(Executor):
         self.position_cost = 0.0
         self.realized_pnl = 0.0  # 账户级已实现PnL
         self._clock = clock  # HistoricalClock
+        self.symbol = symbol or config.SYMBOL
         self.active_orders: dict[int, dict] = {}
         self._connected = True
         self._next_order_id = 1

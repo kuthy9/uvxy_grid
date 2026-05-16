@@ -545,3 +545,13 @@ class IBKRExecutor(Executor):
             pass
 
         return None
+
+    @classmethod
+    def _is_client_id_in_use_error(cls, error: Exception) -> bool:
+        """检测 IBKR 'client id already in use' (error 326) 错误.
+
+        多标的启动时若 client_id 冲突, IB Gateway 返回 error 326 或含
+        'client id is already' 短语. 调用方据此做重试 / 重新分配 client_id.
+        """
+        msg = str(error).lower()
+        return "326" in msg or "client id is already" in msg

@@ -98,10 +98,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 
 class ReportGenerator:
-    def __init__(self, db_path: str = None, report_dir: str = None):
+    def __init__(self, db_path: str = None, report_dir: str = None,
+                 symbol: str = None):
         self.db_path = db_path or config.DB_FILE
         self.report_dir = Path(report_dir or config.REPORT_DIR)
         self.report_dir.mkdir(exist_ok=True)
+        self.symbol = symbol or config.SYMBOL
 
     def generate_weekly_report(self, account_data: dict,
                                 grid_data: dict = None) -> str:
