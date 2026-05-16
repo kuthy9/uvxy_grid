@@ -271,6 +271,10 @@ class RiskManager:
         return RiskCheckResult(True)
 
     def check_daily_loss(self) -> RiskCheckResult:
+        # 多标的: 账户级日亏损委托给 account_risk (已聚合所有 bot)
+        if self.account_risk is not None:
+            return self.account_risk.check_daily_loss()
+        # 单标的: per-bot 旧逻辑
         if self._daily_loss_triggered:
             return RiskCheckResult(False, "单日亏损上限")
         today_pnl = self.db.get_today_realized_pnl()
