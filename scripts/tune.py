@@ -131,6 +131,8 @@ def _worker_run(args: tuple) -> dict:
     # 也要更新 interval
     config.STRATEGY_INTERVAL = _WORKER_INTERVAL
     config.BT_REALISTIC_FILLS = True
+    # 回测必须注入 TOTAL_CAPITAL (否则 require_total_capital() 抛 RuntimeError)
+    config.TOTAL_CAPITAL = CAPITAL
 
     try:
         runner = BacktestRunner(df=df_used, symbol=config.SYMBOL,

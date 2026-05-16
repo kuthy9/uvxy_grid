@@ -1,0 +1,44 @@
+{
+  "interval": "4h",
+  "chosen_params": {
+    "ENTRY_MAX_ADX": 20,
+    "ENTRY_MAX_ATR_PCT": 0.045,
+    "GRID_SPACING_ATR_MULTIPLIER": 0.4,
+    "GRID_RECENTER_THRESHOLD_ATR": 1.0,
+    "EXIT_MAX_ADX": 22
+  },
+  "baseline": {
+    "ENTRY_MAX_ADX": 20,
+    "ENTRY_MAX_ATR_PCT": 0.045,
+    "GRID_SPACING_ATR_MULTIPLIER": 0.4,
+    "GRID_RECENTER_THRESHOLD_ATR": 1.0,
+    "EXIT_MAX_ADX": 22
+  },
+  "comparison": {
+    "chosen": {
+      "total_return_pct": 224.54529808283624,
+      "annualized_return_pct": 26.601065893007924,
+      "max_drawdown_pct": 15.219378907495626,
+      "max_dd_days": 1086,
+      "sharpe": 0.31716355023313747,
+      "win_rate_pct": 63.1578947368421,
+      "total_pnl": 4570.343603656729,
+      "commission": 104.8396513432745,
+      "sessions": 34,
+      "recenters": 32,
+      "exits": 33,
+      "round_trips": 38,
+      "ENTRY_MAX_ADX": 20,
+      "ENTRY_MAX_ATR_PCT": 0.045,
+      "GRID_SPACING_ATR_MULTIPLIER": 0.4,
+      "GRID_RECENTER_THRESHOLD_ATR": 1.0,
+      "EXIT_MAX_ADX": 22,
+      "score": 0.46304549636355175
+    }
+  },
+  "walkforward_summary": {
+    "windows": 6,
+    "mean_valid_sharpe": -0.008416624092646902,
+    "mean_valid_return_pct": 24.768821005359
+  }
+}
