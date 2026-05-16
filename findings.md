@@ -299,3 +299,31 @@ Gate 矩阵:
 - `BT_*` 参数未与 paper trading 对账
 
 **结论保持**: `config.TURBO_ENABLED` 默认 OFF (P9), EXPERIMENTAL banner (P9), 中性 regression test (P9) 都仍是正确决策.
+
+---
+
+## F10. 生产级重构 (2026-05-15 会话 5)
+
+**Spec**: docs/superpowers/specs/2026-05-15-production-refactor-design.md
+**Plan**: docs/superpowers/plans/2026-05-15-production-refactor.md
+**Report**: reports/refactor_2026_05_15.md
+
+### 主要变化
+- 战术化 archived 到 archive/tactical/ (3 模块 + 3 sweep 工具 + tests + reports)
+- 11 tracked file 撤销到 `8c41c62`, 然后选择性 re-apply (risk_manager 4.A / grid_bot 4.E / config 4.C / entry_filter 4.B / main.py Phase 5)
+- main.py 默认 MultiSymbolOrchestrator (UVXY+VXX 50/50)
+- 多标的 5y +201.69% 复现 (D5 +153.93% 是 VXX 数据快照, 后增长 → +201.69%, 不是 hardcode)
+
+### 修复的 5 个 bug (+ 1 plan-discovered + 1 Phase-6-discovered)
+- 4.A risk_manager multi-symbol capital reference (D5 发现, re-applied + check_daily_loss delegation gap 补)
+- 4.B entry_filter.py getattr fallback dead code
+- 4.C config.py L211 stale comment + ENTRY_MAX_ADX_SLOPE re-introduce
+- 4.D V49 → 8c41c62 -27pp 回归 (定位 first bad = e369447, 未修)
+- 4.E (plan-discovered) GridBot allocated_capital + symbol property 支持
+- Phase 6-discovered: grid_engine.py 3 处 wall-clock 违规修复 (CLAUDE.md §9)
+
+### 仍未做
+- V49 -27pp 修复 (Phase 4.D follow-up)
+- 29 个 test fails/errors 修复 (T2/T3 sequencing 残留, 独立 spec)
+- 实盘 paper >= 4 周对账 (CLAUDE.md §7)
+- CLAUDE.md §1 描述更新 (user 明确不动)

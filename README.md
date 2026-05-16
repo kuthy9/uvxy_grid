@@ -124,8 +124,13 @@ IBKR 对账      ← reqAllOpenOrders + portfolio() (实盘)
 # 测试
 python test.py
 
-# 回测 (默认 4h)
+# 回测 (默认 4h, 单标的)
 python backtest.py --csv data/uvxy_4h.csv --interval 4h --capital 2000
+
+# 多标的回测 (UVXY+VXX 50/50)
+python scripts/run_multi_backtest.py --symbols UVXY VXX \
+    --csv data/uvxy_4h.csv data/vxx_4h.csv --allocations 0.5 0.5 \
+    --capital 10000 --interval 4h
 
 # 调参 (单 interval 完整 pipeline)
 python scripts/tune.py --interval 4h --workers 7
@@ -133,8 +138,11 @@ python scripts/tune.py --interval 4h --workers 7
 # 跨 interval 汇总
 python scripts/compare_intervals.py
 
-# 实盘 (本地)
-IBKR_HOST=127.0.0.1 IBKR_PORT=7497 python main.py
+# 实盘 Paper 验证 (smoke test)
+python main.py --paper-verify
+
+# 实盘多标的 (默认 UVXY+VXX 50/50, Paper)
+IBKR_HOST=127.0.0.1 IBKR_PORT=4002 python main.py
 
 # 实盘 (Docker, 需要本地 .env 提供 TWS_USERID/TWS_PASSWORD/TRADING_MODE 等)
 docker compose up -d
@@ -146,17 +154,25 @@ docker compose up -d
 
 ## 5. 当前能力快照
 
-> 数值会随研究推进变化；权威来源是 [`PROJECT_STATUS.md`](./PROJECT_STATUS.md) 与
-> `runtime/experiments/` 下的产物。
+> 数值会随研究推进变化, 权威来源是 [`findings.md`](./findings.md) +
+> `runtime/experiments/` 下的产物.
 
-- **当前默认基线**：`UVXY` × `4h` × `config.py` 中的当前参数版本
-- **回测样本**：UVXY 5 年 4h CSV
-- **支持的策略周期**：`15m` / `1h` / `4h` / `1d` (改 `config.STRATEGY_INTERVAL` 即可，
-  系统其他模块全部跟随)
-- **典型 5y 回测指标 (4h V49 真实化撮合)**：总收益 +103%，年化 +15%，
-  Sharpe +0.55，MDD ~9%，胜率 ~84%，walk-forward valid Sharpe ~1.0
-  *(指标定义和具体数字见 PROJECT_STATUS.md §2)*
-- **测试覆盖**：15 个 TestCase 类 / 77 个 `test_*` 用例
+- **当前默认基线**: `UVXY+VXX 50/50` × `4h` × `MultiSymbolOrchestrator`
+- **回测样本**:
+  - UVXY 5y 4h CSV (Alpaca IEX, 2021-01-04 → 2026-04-24)
+  - VXX  ~5y 4h CSV (Alpaca IEX, 2021-05-17 → 2026-05-14)
+- **支持的策略周期**: `15m` / `1h` / `4h` / `1d` (改 `config.STRATEGY_INTERVAL` 即可)
+- **当前 5y 回测指标 ($10,000 capital, 真实化撮合)**:
+  - **多标的合并 (UVXY+VXX 50/50)**: ret **+201.69%** / annu +25.07% / MDD 17.35%
+  - UVXY sub-bot ($5,000): ret +76.46%
+  - VXX  sub-bot ($5,000): ret +326.92%
+- **单标的参考** (回测 + sanity, 不是实盘默认):
+  - UVXY: +82.81% / 年化 +12.05% / MDD 15.86%
+  - VXX: +226.79% / 年化 +26.78% / MDD 15.17%
+- **战术化已 archived** (2026-05-15 严证伪通过): 详见
+  [`archive/tactical/reports/tactical_proof_of_impossibility.md`](./archive/tactical/reports/tactical_proof_of_impossibility.md)
+- **测试覆盖**: 252 个 `test_*` 用例 (含 ~51 个 tactical-related skipped)
+- **历史 baseline**: D5 报告 +153.93% (2026-05-15 早期 VXX 数据快照, 现 VXX 延至 5/14 后实测 +201.69%)
 
 ---
 
