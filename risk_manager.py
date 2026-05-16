@@ -34,16 +34,30 @@ class RiskCheckResult:
 
 
 class RiskManager:
-    def __init__(self, db, clock=None):
+    def __init__(self, db, clock=None,
+                 allocated_capital: Optional[float] = None,
+                 account_risk=None,
+                 capital_provider=None,
+                 symbol: Optional[str] = None):
         """
-        db    : TradeDatabase (或 TradeEventCollector, 兼容)
-        clock : Clock 协议实例. None = LiveClock (即系统时间).
+        db               : TradeDatabase (或 TradeEventCollector, 兼容)
+        clock            : Clock 协议实例. None = LiveClock (即系统时间).
+        allocated_capital: 多标的支持 — 本 bot 的资金分配额 (USD).
+                           None → fallback config.require_total_capital() (单标的旧行为).
+        account_risk     : 共享账户级 AccountRiskManager. 多标的时传同一个实例;
+                           None → 单标的旧行为 (per-bot 独立风控).
+        capital_provider : 保留接口 (Phase 4.B 动态资金). 当前版本吸收, 不启用.
+        symbol           : 标的代码 (用于日志 / on_trade_closed). 可选.
         """
         if clock is None:
             from interfaces import LiveClock
             clock = LiveClock()
         self.db = db
         self.clock = clock
+        self._allocated_capital = allocated_capital
+        self.account_risk = account_risk   # 可由外部读取 (测试 / orchestrator)
+        self._capital_provider = capital_provider  # Phase 4.B 预留, 当前不使用
+        self._symbol = symbol
         self._daily_loss_triggered = False
         self._hard_stop_triggered = False
         self._flash_crash_triggered = False
@@ -52,6 +66,31 @@ class RiskManager:
         self._intraday_snapshots: list[tuple[datetime, float]] = []
         # Bug I: 最新 ATR% (用于动态闪崩阈值)
         self._current_atr_pct: Optional[float] = None
+
+    def _capital_reference(self) -> float:
+        """返回风控 baseline 资金值.
+
+        2026-05-15 Phase 4.A: 多标的传 allocated_capital, 单标的 fallback
+        config.require_total_capital(). 修复 sub-bot 启动时虚假 hard_stop bug.
+        """
+        if self._allocated_capital is not None:
+            return float(self._allocated_capital)
+        return float(config.require_total_capital())
+
+    def on_trade_closed(self, symbol: str, net_pnl: float,
+                        note: str = "") -> None:
+        """平仓事件通知.
+
+        单标的: no-op (不报错).
+        多标的 (account_risk 存在): 写入共享 account_trade_pnl + 失效 equity 缓存.
+        """
+        if self.account_risk is None:
+            return
+        try:
+            self.account_risk.contribute_trade_pnl(symbol, net_pnl, note=note)
+            self.account_risk.invalidate_equity_cache()
+        except Exception as e:
+            logger.warning(f"on_trade_closed 写入 account_risk 失败 (非致命): {e}")
 
     def _now(self) -> datetime:
         """当前时间 — 统一通过 clock, backtest/live 都安全"""
@@ -215,9 +254,14 @@ class RiskManager:
         return RiskCheckResult(True)
 
     def check_hard_stop(self, equity: float) -> RiskCheckResult:
+        # 多标的: 账户级硬止损委托给 account_risk (已聚合所有 bot)
+        if self.account_risk is not None:
+            return self.account_risk.check_hard_stop(account_equity=equity)
+        # 单标的: per-bot 旧逻辑, 基准资金改用 _capital_reference()
         if self._hard_stop_triggered:
             return RiskCheckResult(False, "硬止损已触发")
-        loss_pct = (config.TOTAL_CAPITAL - equity) / config.TOTAL_CAPITAL
+        baseline = self._capital_reference()
+        loss_pct = (baseline - equity) / baseline
         if loss_pct >= config.HARD_STOP_LOSS_PCT:
             self._hard_stop_triggered = True
             self.db.log_risk_event("HARD_STOP",
@@ -230,7 +274,7 @@ class RiskManager:
         if self._daily_loss_triggered:
             return RiskCheckResult(False, "单日亏损上限")
         today_pnl = self.db.get_today_realized_pnl()
-        limit = config.require_total_capital() * config.MAX_DAILY_LOSS_PCT
+        limit = self._capital_reference() * config.MAX_DAILY_LOSS_PCT
         if today_pnl < -limit:
             self._daily_loss_triggered = True
             self.db.log_risk_event(
@@ -256,7 +300,7 @@ class RiskManager:
         return RiskCheckResult(True)
 
     def check_position_limit(self, position_value: float) -> RiskCheckResult:
-        max_v = config.TOTAL_CAPITAL * config.MAX_POSITION_VALUE_PCT
+        max_v = self._capital_reference() * config.MAX_POSITION_VALUE_PCT
         if position_value >= max_v:
             return RiskCheckResult(False, f"持仓${position_value:.0f}>上限${max_v:.0f}")
         return RiskCheckResult(True)
@@ -317,6 +361,9 @@ class RiskManager:
         self._intraday_snapshots.clear()
 
     def is_hard_stopped(self) -> bool:
+        # 多标的: 委托给共享 account_risk (账户级状态, 跨 bot 可见)
+        if self.account_risk is not None:
+            return self.account_risk.is_hard_stopped()
         return self._hard_stop_triggered
 
     def manual_resume(self):
