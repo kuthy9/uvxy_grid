@@ -66,13 +66,17 @@ class DynamicGridEngine:
                  current_time: Optional[datetime] = None):
         """
         初始化网格
-        
+
         Args:
             center_price: 初始中轴价
             atr: 当前ATR (用于动态间距)
             spacing_pct: 间距百分比 (None=自动计算)
             grid_capital: 网格可用资金 (None=使用config默认)
+            current_time: 当前时刻 (必须显式传递，GridEngine 业务模块禁止使用 wall-clock)
         """
+        if current_time is None:
+            raise ValueError("current_time 必须显式传递，GridEngine 业务模块禁止使用 wall-clock")
+
         self.center_price = center_price
         self.atr_at_init = atr
         self.spacing_pct = spacing_pct or self._compute_spacing(atr, center_price)
@@ -85,7 +89,6 @@ class DynamicGridEngine:
         self.total_filled_sells = 0
         self.is_frozen = False
         self.freeze_reason = ""
-        current_time = current_time or datetime.now()
         self.grid_init_time = current_time.isoformat()
         self.last_recenter_time = self.grid_init_time
 
@@ -188,13 +191,17 @@ class DynamicGridEngine:
                         current_time: Optional[datetime] = None) -> tuple[bool, str]:
         """
         判断是否应该重置中轴
-        
+
         触发条件:
           1. EMA偏离当前中轴 > 1.5 × ATR
           2. 距上次重置 > 最小间隔时间
+
+        Args:
+            current_time: 当前时刻 (必须由调用方显式传递，不使用 wall-clock 默认值)
         """
         # 检查时间间隔（防止过频抖动）
-        current_time = current_time or datetime.now()
+        if current_time is None:
+            raise ValueError("current_time 必须显式传递，GridEngine 业务模块禁止使用 wall-clock")
         last_recenter = datetime.fromisoformat(self.last_recenter_time)
         strategy_hours = config.strategy_interval_hours()
         elapsed_bars = (current_time - last_recenter).total_seconds() / (strategy_hours * 3600)
@@ -216,7 +223,10 @@ class DynamicGridEngine:
                  current_time: Optional[datetime] = None) -> dict:
         """
         重置中轴，重建所有档位
-        
+
+        Args:
+            current_time: 当前时刻 (必须由调用方显式传递，不使用 wall-clock 默认值)
+
         Returns:
             重置信息字典 (含需要撤销的订单ID列表)
         """
@@ -230,7 +240,8 @@ class DynamicGridEngine:
                 orders_to_cancel.append(lv.order_id)
 
         # 重新计算
-        current_time = current_time or datetime.now()
+        if current_time is None:
+            raise ValueError("current_time 必须显式传递，GridEngine 业务模块禁止使用 wall-clock")
         self.center_price = new_center
         self.atr_at_init = new_atr
         self.spacing_pct = self._compute_spacing(new_atr, new_center)

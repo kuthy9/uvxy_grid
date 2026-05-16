@@ -397,7 +397,8 @@ class TestGridEngine(unittest.TestCase):
 
     def test_recenter_rebuilds_grid(self):
         old_center = self.engine.center_price
-        self.engine.recenter(new_center=120.0, new_atr=2.5)
+        self.engine.recenter(new_center=120.0, new_atr=2.5,
+                            current_time=datetime(2025, 1, 1, 11, 0))
         self.assertEqual(self.engine.center_price, 120.0)
         # 档位价格都应重建
         self.assertNotAlmostEqual(self.engine.levels[1].price,
@@ -439,11 +440,13 @@ class TestGridEngine(unittest.TestCase):
         self.assertFalse(should)
 
     def test_spacing_clamped_to_min(self):
-        e = DynamicGridEngine(center_price=100.0, atr=0.001, grid_capital=5000.0)
+        e = DynamicGridEngine(center_price=100.0, atr=0.001, grid_capital=5000.0,
+                              current_time=datetime(2025, 1, 1, 10, 0))
         self.assertGreaterEqual(e.spacing_pct, config.GRID_MIN_SPACING_PCT)
 
     def test_spacing_clamped_to_max(self):
-        e = DynamicGridEngine(center_price=100.0, atr=100.0, grid_capital=5000.0)
+        e = DynamicGridEngine(center_price=100.0, atr=100.0, grid_capital=5000.0,
+                              current_time=datetime(2025, 1, 1, 10, 0))
         self.assertLessEqual(e.spacing_pct, config.GRID_MAX_SPACING_PCT)
 
     def test_frozen_grid_emits_no_signals(self):
