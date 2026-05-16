@@ -739,6 +739,7 @@ class GridBot:
             center_price=evaluation.suggested_center,
             atr=evaluation.suggested_atr,
             spacing_pct=evaluation.suggested_spacing_pct,
+            grid_capital=self._capital() * config.GRID_CAPITAL_RATIO,
             current_time=self.clock.now(),
         )
         logger.info(self.grid.get_grid_summary())

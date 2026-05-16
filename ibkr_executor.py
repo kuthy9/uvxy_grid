@@ -23,9 +23,18 @@ ET = ZoneInfo("America/New_York")
 class IBKRExecutor(Executor):
     """IBKR 实盘执行器"""
 
-    def __init__(self):
+    def __init__(self,
+                 symbol: str = None,
+                 exchange: str = None,
+                 currency: str = None,
+                 client_id: int = None):
+        # 多标的注入; 未传则 fallback 到 config (单标的路径向后兼容)
+        self.symbol = symbol or config.SYMBOL
+        self.exchange = exchange or config.EXCHANGE
+        self.currency = currency or config.CURRENCY
+        self.client_id = client_id if client_id is not None else config.IBKR_CLIENT_ID
         self.ib = IB()
-        self.contract = Stock(config.SYMBOL, config.EXCHANGE, config.CURRENCY)
+        self.contract = Stock(self.symbol, self.exchange, self.currency)
         self.active_orders: dict[int, dict] = {}
         self._pnl_sub_id = None  # reqPnL 订阅 ID
         # 行情等级: None=未设置, 1=live, 3=delayed. 连接后初始化; live 超时会降级并缓存.
@@ -36,7 +45,7 @@ class IBKRExecutor(Executor):
     def connect(self) -> bool:
         try:
             self.ib.connect(config.IBKR_HOST, config.IBKR_PORT,
-                            clientId=config.IBKR_CLIENT_ID)
+                            clientId=self.client_id)
             self.ib.qualifyContracts(self.contract)
             # 行情等级: 默认 config.MARKET_DATA_TYPE (1=live). 若账户无 live 订阅,
             # get_current_price() 超时后会显式降级到 3 (delayed) 并缓存.
@@ -129,7 +138,7 @@ class IBKRExecutor(Executor):
             # live (1) 首次 attempt 内 timeout → 降级 delayed (3) 重试一次
             if self._market_data_type_effective == 1:
                 logger.warning(
-                    f"⚠️ {config.SYMBOL} live 行情 {timeout:.0f}s 无推送, "
+                    f"⚠️ {self.symbol} live 行情 {timeout:.0f}s 无推送, "
                     f"降级为 delayed(15min). 后续本进程都用 delayed, 重连会重新评估. "
                     f"attempt={attempt}/{max_retries}"
                 )
@@ -218,7 +227,7 @@ class IBKRExecutor(Executor):
             logger.warning(f"reqHistoricalData 失败: {e}")
             return None
         if not bars:
-            logger.warning(f"{config.SYMBOL} 历史日线为空, 无法取 prev_close")
+            logger.warning(f"{self.symbol} 历史日线为空, 无法取 prev_close")
             return None
 
         today_et = datetime.now(ET).date()
@@ -230,7 +239,7 @@ class IBKRExecutor(Executor):
                 logger.info(f"  prev_close={bar.close:.2f} (from {bar_date.isoformat()} 日线)")
                 return float(bar.close)
         logger.warning(
-            f"{config.SYMBOL} 历史日线 {len(bars)} 根, 但无一根 date<today (ET={today_et})"
+            f"{self.symbol} 历史日线 {len(bars)} 根, 但无一根 date<today (ET={today_et})"
         )
         return None
 
@@ -416,7 +425,7 @@ class IBKRExecutor(Executor):
             return {"shares": 0.0, "avg_cost": 0.0,
                     "market_value": 0.0, "unrealized_pnl": 0.0}
         for item in self.ib.portfolio():
-            if item.contract.symbol == config.SYMBOL:
+            if item.contract.symbol == self.symbol:
                 return {
                     "shares": float(item.position),
                     "avg_cost": float(item.averageCost),
@@ -434,7 +443,7 @@ class IBKRExecutor(Executor):
         keys = ["NetLiquidation", "TotalCashValue", "GrossPositionValue",
                 "UnrealizedPnL", "RealizedPnL", "BuyingPower"]
         for v in values:
-            if v.tag in keys and v.currency in (config.CURRENCY, "BASE"):
+            if v.tag in keys and v.currency in (self.currency, "BASE"):
                 try:
                     summary[v.tag] = float(v.value)
                 except (TypeError, ValueError):
@@ -463,7 +472,7 @@ class IBKRExecutor(Executor):
         # 持仓 — portfolio() 只返回当前 account 的 symbol 列表
         try:
             for item in self.ib.portfolio():
-                if item.contract.symbol == config.SYMBOL:
+                if item.contract.symbol == self.symbol:
                     result["position_shares"] = float(item.position)
                     break
         except Exception as e:
@@ -476,7 +485,7 @@ class IBKRExecutor(Executor):
             self.ib.sleep(1.0)
             for trade in self.ib.openTrades():
                 c = trade.contract
-                if getattr(c, "symbol", None) != config.SYMBOL:
+                if getattr(c, "symbol", None) != self.symbol:
                     continue
                 status = trade.orderStatus.status or ""
                 if status in ("Filled", "Cancelled", "Inactive"):
