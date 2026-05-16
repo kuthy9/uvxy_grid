@@ -34,8 +34,6 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import config
-import tactical_config as tcfg
-import tactical_rules as trules
 from account_risk import AccountRiskManager
 from capital_allocator import (
     CapitalAllocator, AllocationError,
@@ -52,13 +50,30 @@ from interfaces import LiveClock
 from orchestrator import MultiSymbolOrchestrator
 from pnl_tracker import PnLTracker
 from risk_manager import RiskManager
-from session_manager import (
-    SessionManager, SessionContext,
-    ACTION_NONE, ACTION_ENTER_DEFENSIVE, ACTION_FORCE_EXIT,
-    ACTION_PROFIT_PROTECT_EXIT, ACTION_PARTIAL_PROFIT_EXIT,
-)
 from state_machine import StateMachine, SystemState, is_grid_state
 from trade_logger import TradeDatabase
+
+# Tactical modules archived 2026-05-15. import-guard.
+try:
+    import tactical_config as tcfg
+    import tactical_rules as trules
+    from session_manager import (
+        SessionManager, SessionContext,
+        ACTION_NONE, ACTION_ENTER_DEFENSIVE, ACTION_FORCE_EXIT,
+        ACTION_PROFIT_PROTECT_EXIT, ACTION_PARTIAL_PROFIT_EXIT,
+    )
+    _TACTICAL_AVAILABLE = True
+except ImportError:
+    _TACTICAL_AVAILABLE = False
+    tcfg = None
+    trules = None
+    SessionManager = None
+    SessionContext = None
+    ACTION_NONE = None
+    ACTION_ENTER_DEFENSIVE = None
+    ACTION_FORCE_EXIT = None
+    ACTION_PROFIT_PROTECT_EXIT = None
+    ACTION_PARTIAL_PROFIT_EXIT = None
 
 
 def setUpModule():
@@ -82,6 +97,8 @@ def _patch_tactical_on(test_case):
             _patch_tactical_on(self)
             ...  # 原有 setUp 代码
     """
+    if not _TACTICAL_AVAILABLE:
+        test_case.skipTest("tactical modules archived 2026-05-15")
     import tactical_config as _tcfg
     import config as _cfg
     orig_tcfg = _tcfg.TACTICAL_GRID_ENABLED
@@ -1897,6 +1914,10 @@ class TestReportGeneratorSessionAggregation(unittest.TestCase):
 # ════════════════════════════════════════════
 
 class TestTrendRiskScore(unittest.TestCase):
+    def setUp(self):
+        if not _TACTICAL_AVAILABLE:
+            self.skipTest("tactical modules archived 2026-05-15")
+
     def test_calm_market_low_score(self):
         ctx = trules.MarketContext(
             current_price=10.0, ema=10.0, atr=0.2, atr_pct=0.02,
@@ -1932,6 +1953,10 @@ class TestTrendRiskScore(unittest.TestCase):
 
 
 class TestConfidence(unittest.TestCase):
+    def setUp(self):
+        if not _TACTICAL_AVAILABLE:
+            self.skipTest("tactical modules archived 2026-05-15")
+
     def test_calm_market_high_confidence(self):
         ctx = trules.MarketContext(
             current_price=10.0, ema=10.0, atr=0.2, atr_pct=0.02,
@@ -1950,6 +1975,10 @@ class TestConfidence(unittest.TestCase):
 
 
 class TestPositionCap(unittest.TestCase):
+    def setUp(self):
+        if not _TACTICAL_AVAILABLE:
+            self.skipTest("tactical modules archived 2026-05-15")
+
     def test_high_confidence_larger_cap(self):
         h_pct, h_lv = trules.calculate_dynamic_position_cap(tcfg.CONFIDENCE_HIGH)
         n_pct, n_lv = trules.calculate_dynamic_position_cap(tcfg.CONFIDENCE_NORMAL)
@@ -1967,6 +1996,10 @@ class TestPositionCap(unittest.TestCase):
 # ════════════════════════════════════════════
 
 class TestDecisionFunctions(unittest.TestCase):
+    def setUp(self):
+        if not _TACTICAL_AVAILABLE:
+            self.skipTest("tactical modules archived 2026-05-15")
+
     def _view(self, **kwargs):
         defaults = dict(
             session_id="sess1", started_at=datetime.now().isoformat(),
@@ -2078,7 +2111,13 @@ class TestDecisionFunctions(unittest.TestCase):
 # ════════════════════════════════════════════
 
 class TestSignalFilters(unittest.TestCase):
-    def _view(self, mode=tcfg.SESSION_MODE_OFFENSIVE, **kwargs):
+    def setUp(self):
+        if not _TACTICAL_AVAILABLE:
+            self.skipTest("tactical modules archived 2026-05-15")
+
+    def _view(self, mode=None, **kwargs):
+        if mode is None:
+            mode = tcfg.SESSION_MODE_OFFENSIVE
         defaults = dict(
             session_id="s1", started_at=datetime.now().isoformat(),
             age_bars=1.0, start_equity=10000.0, current_equity=10000.0,
@@ -2159,7 +2198,9 @@ class TestRecenterDisabledScenarios(unittest.TestCase):
     def setUp(self):
         _patch_tactical_on(self)  # P9 fixup: 这些 test 假设 TURBO=ON
 
-    def _view(self, mode=tcfg.SESSION_MODE_OFFENSIVE):
+    def _view(self, mode=None):
+        if mode is None:
+            mode = tcfg.SESSION_MODE_OFFENSIVE
         return trules.SessionStateView(
             session_id="s1", started_at=datetime.now().isoformat(),
             age_bars=1.0, start_equity=10000.0, current_equity=10000.0,
@@ -2454,6 +2495,8 @@ class TestTacticalBaseZeroEntry(unittest.TestCase):
     直接初始化网格 + 启动 session."""
 
     def setUp(self):
+        if not _TACTICAL_AVAILABLE:
+            self.skipTest("tactical modules archived 2026-05-15")
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
         self._orig_base_ratio = tcfg.TACTICAL_BASE_POSITION_RATIO
@@ -2559,6 +2602,8 @@ class TestTacticalBaseZeroEntry(unittest.TestCase):
 
 class TestSessionManager(unittest.TestCase):
     def setUp(self):
+        if not _TACTICAL_AVAILABLE:
+            self.skipTest("tactical modules archived 2026-05-15")
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
         self.db = TradeDatabase(db_path=self.tmp.name)
@@ -3201,6 +3246,8 @@ class TestMultiSymbolParameterization(unittest.TestCase):
 
     def test_two_session_managers_independent_per_db(self):
         """两个 SessionManager 用不同 db_path 时, session 互不污染."""
+        if not _TACTICAL_AVAILABLE:
+            self.skipTest("tactical modules archived 2026-05-15")
         import os, tempfile
         from interfaces import LiveClock
         from session_manager import SessionManager
@@ -4144,6 +4191,8 @@ class TestTacticalActionsReachable(unittest.TestCase):
     """
 
     def setUp(self):
+        if not _TACTICAL_AVAILABLE:
+            self.skipTest("tactical modules archived 2026-05-15")
         from datetime import datetime
         from interfaces import HistoricalClock
         from trade_logger import TradeDatabase
