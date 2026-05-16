@@ -189,8 +189,8 @@ class EntryFilter:
         # T1: ADX 斜率 > 阈值 → 拒绝. 防止入场在 ADX 上升早期 (即将 break-out).
         # ADX_slope > 0 意味着趋势在加强, 即使当前值低于 ENTRY_MAX_ADX 也是
         # "ranging 即将结束". 把这种 entry 拦掉能减少 BUY-only 单边下跌 session.
-        lookback_adx = max(2, int(getattr(config, "ENTRY_ADX_SLOPE_LOOKBACK_BARS", 3)))
-        max_slope = float(getattr(config, "ENTRY_MAX_ADX_SLOPE", -1.0))
+        lookback_adx = max(2, int(config.ENTRY_ADX_SLOPE_LOOKBACK_BARS))
+        max_slope = float(config.ENTRY_MAX_ADX_SLOPE)
         if max_slope >= -100 and "ADX" in df.columns and len(df) >= lookback_adx + 1:
             recent_adx = df["ADX"].tail(lookback_adx + 1)
             # 简单斜率: (今 - lookback 前) / lookback
