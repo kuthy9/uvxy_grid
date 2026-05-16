@@ -69,6 +69,16 @@ QUICK_GRID = {
     "EXIT_MAX_ADX":                 [20, 25],
 }
 
+# 2026-05-16: 扩展 grid for Phase B active tuning (更激进 value).
+# 总 combos = 5 × 4 × 5 × 4 × 5 = 2000.
+EXTENDED_GRID = {
+    "ENTRY_MAX_ADX":                [15, 20, 25, 30, 40],
+    "ENTRY_MAX_ATR_PCT":            [0.035, 0.045, 0.055, 0.07],
+    "GRID_SPACING_ATR_MULTIPLIER":  [0.25, 0.30, 0.40, 0.50, 0.60],
+    "GRID_RECENTER_THRESHOLD_ATR":  [0.6, 0.8, 1.0, 1.2],
+    "EXIT_MAX_ADX":                 [20, 22, 25, 28, 35],
+}
+
 BASELINE = {
     "ENTRY_MAX_ADX":                20,
     "ENTRY_MAX_ATR_PCT":            0.045,
@@ -93,19 +103,33 @@ def score(row: dict, beta_dd: float = 0.5) -> float:
     return 0.6 * row["sharpe"] + 0.4 * (ann / (dd ** beta_dd))
 
 
+def active_score(row: dict) -> float:
+    """Active strategy 评分: annualized × (trades / 100) × wf_pass_rate.
+
+    2026-05-16 Phase B: 接受 Sharpe drop, 优先 trade 频率 + WF 稳健 + 收益.
+    单 cell grid search 时 wf_pass_rate 用 1.0 占位 (walk-forward 阶段才有实际值).
+    """
+    ann = row.get("annualized_return_pct", 0)
+    trades = row.get("total_trades", 0)
+    wf_pass = row.get("wf_pass_rate", 1.0)
+    return float(ann) * (float(trades) / 100.0) * float(wf_pass)
+
+
 # ──────────────────────────────────────────
 #  Worker (在 subprocess 里跑)
 # ──────────────────────────────────────────
 
 _WORKER_DF = None
 _WORKER_INTERVAL = None
+_WORKER_USE_ACTIVE = False
 
 
-def _worker_init(csv_path: str, interval: str):
+def _worker_init(csv_path: str, interval: str, use_active: bool = False):
     """每个 worker 初始化时加载数据 (避免 pickle 传大 DataFrame)"""
-    global _WORKER_DF, _WORKER_INTERVAL
+    global _WORKER_DF, _WORKER_INTERVAL, _WORKER_USE_ACTIVE
     _WORKER_DF = load_market_data("UVXY", interval, 9999, csv_path=csv_path)
     _WORKER_INTERVAL = interval
+    _WORKER_USE_ACTIVE = use_active
 
 
 def _worker_run(args: tuple) -> dict:
@@ -152,12 +176,16 @@ def _worker_run(args: tuple) -> dict:
         "total_pnl":            float(stats.total_realized_pnl),
         "commission":           float(stats.total_commission),
         "sessions":             int(stats.total_grid_sessions),
+        "total_trades":         int(stats.total_trades),
         "recenters":            int(stats.total_recenters),
         "exits":                int(stats.total_exits),
         "round_trips":          int(stats.grid_round_trips),
         **params,
     }
-    out["score"] = score(out)
+    if _WORKER_USE_ACTIVE:
+        out["score"] = active_score(out)
+    else:
+        out["score"] = score(out)
     if window is not None:
         out["win_start"] = str(window[0].date() if hasattr(window[0], "date") else window[0])
         out["win_end"]   = str(window[1].date() if hasattr(window[1], "date") else window[1])
@@ -169,11 +197,12 @@ def _worker_run(args: tuple) -> dict:
 # ──────────────────────────────────────────
 
 def run_parallel(tasks: list, csv_path: str, interval: str,
-                 workers: int, label: str = "") -> list[dict]:
+                 workers: int, label: str = "",
+                 use_active: bool = False) -> list[dict]:
     """tasks = list of (params_dict, window_tuple_or_None)"""
     ctx = get_context("fork")  # fork 避免重新 import 整个 config
     with ctx.Pool(workers, initializer=_worker_init,
-                  initargs=(csv_path, interval)) as pool:
+                  initargs=(csv_path, interval, use_active)) as pool:
         results = []
         t0 = time.time()
         last_print = t0
@@ -193,11 +222,13 @@ def run_parallel(tasks: list, csv_path: str, interval: str,
 # ──────────────────────────────────────────
 
 def grid_search(csv_path: str, interval: str, space: dict,
-                workers: int, exp_dir: Path) -> pd.DataFrame:
+                workers: int, exp_dir: Path,
+                use_active: bool = False) -> pd.DataFrame:
     combos = all_combos(space)
     print(f"[search] {len(combos)} 组参数 on {interval} | workers={workers}")
     tasks = [(p, None) for p in combos]
-    rows = run_parallel(tasks, csv_path, interval, workers, label="grid")
+    rows = run_parallel(tasks, csv_path, interval, workers, label="grid",
+                        use_active=use_active)
     rows = [r for r in rows if "__error__" not in r]
     df_out = pd.DataFrame(rows).sort_values("score", ascending=False)
     df_out.to_csv(exp_dir / "search_log.csv", index=False)
@@ -381,6 +412,10 @@ def main():
     ap.add_argument("--csv", default=None,
                     help="CSV 路径 (不指定则按 interval 推断: data/uvxy_<interval>.csv)")
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--extended", action="store_true",
+                    help="用 EXTENDED_GRID (2000 combos) 替代 FULL_GRID")
+    ap.add_argument("--active-score", action="store_true",
+                    help="用 active_score (ann × trades × wf) 替代默认 score")
     ap.add_argument("--top-n", type=int, default=8)
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--skip-walkforward", action="store_true")
@@ -399,6 +434,9 @@ def main():
 
     if args.quick:
         space = QUICK_GRID
+    elif args.extended:
+        space = EXTENDED_GRID
+        print("[extended] 使用 EXTENDED_GRID (2000 combos, Phase B active tuning)")
     elif interval == "1d":
         # 1d UVXY ATR% 中位 8%, 与 4h 基线完全不同量级, 需放宽阈值网格
         space = GRID_1D
@@ -422,7 +460,8 @@ def main():
     data_end = df.index[-1]
 
     # 1) 全网格 on full
-    results = grid_search(csv_path, interval, space, args.workers, exp_dir)
+    results = grid_search(csv_path, interval, space, args.workers, exp_dir,
+                          use_active=args.active_score)
     print(f"[search] 完成. top 3 by score:")
     print(results.head(3)[["score", "sharpe", "total_return_pct",
                            "max_drawdown_pct", "win_rate_pct"]].to_string())
