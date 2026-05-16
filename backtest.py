@@ -29,7 +29,7 @@ from interfaces import HistoricalClock
 from pnl_tracker import PnLTracker
 from risk_manager import RiskManager
 from simulated_executor import SimulatedExecutor
-from state_machine import StateMachine, SystemState
+from state_machine import StateMachine, SystemState, is_grid_state
 from trade_logger import TradeDatabase
 
 NY_TZ = "America/New_York"
@@ -264,12 +264,8 @@ class BacktestRunner:
         # 统计
         self.equity_curve: list[float] = []
         self.session_durations_hours: list[float] = []
-        self.state_durations = {
-            SystemState.SCANNING: 0,
-            SystemState.WAITING_ENTRY: 0,
-            SystemState.ACTIVE_GRID: 0,
-            SystemState.EXIT_PENDING: 0,
-        }
+        # 2026-05-15 Phase 4.E: 覆盖所有 SystemState 成员, 避免新增状态引发 KeyError.
+        self.state_durations = {s: 0 for s in SystemState}
         self._peak_equity = capital
         self._peak_time = self.df.index[0].to_pydatetime()
         self._max_dd = 0.0
@@ -319,15 +315,15 @@ class BacktestRunner:
             # 会话持续时间统计
             st_before = self.state_machine.state
             self.state_durations[st_before] += 1
-            if st_before == SystemState.ACTIVE_GRID and self._session_start is None:
+            if is_grid_state(st_before) and self._session_start is None:
                 self._session_start = ts
 
             # 执行一步
             self.bot.step()
 
             # 会话结束
-            if (st_before == SystemState.ACTIVE_GRID and
-                self.state_machine.state != SystemState.ACTIVE_GRID and
+            if (is_grid_state(st_before) and
+                not is_grid_state(self.state_machine.state) and
                 self._session_start is not None):
                 dur = (ts - self._session_start).total_seconds() / 3600
                 self.session_durations_hours.append(dur)
@@ -401,7 +397,9 @@ class BacktestRunner:
 
         total_bars = len(self.df)
         if total_bars:
-            stats.time_in_grid_pct = self.state_durations[SystemState.ACTIVE_GRID] / total_bars * 100
+            # 2026-05-15 Phase 4.E: 合并所有网格状态 (OFFENSIVE/DEFENSIVE/ACTIVE) 的时间
+            grid_bars = sum(v for k, v in self.state_durations.items() if is_grid_state(k))
+            stats.time_in_grid_pct = grid_bars / total_bars * 100
             stats.time_in_scan_pct = self.state_durations[SystemState.SCANNING] / total_bars * 100
 
         # Sharpe: 日线 N=TRADING_DAYS_PER_YEAR, 否则按 bar 间隔换算

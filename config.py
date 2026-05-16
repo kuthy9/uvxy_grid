@@ -77,33 +77,6 @@ def ibkr_port_label(port: int) -> tuple[str, str]:
     return "unknown", f"Unknown port {port}"
 
 # ════════════════════════════════════════════
-#  引擎模式开关 ("涡轮增压" — 战术 Session 网格)
-#
-#  TURBO_ENABLED = True  → 启用激进战术 Session 网格. 包含:
-#                          - 6 状态 FSM (SCANNING/WAITING/OFFENSIVE/DEFENSIVE/EXIT/COOLDOWN)
-#                          - SessionManager (战役级风控: SOFT/HARD/AGE/PROFIT_PROTECT)
-#                          - tactical_rules (信号过滤 / DEFENSIVE 切换 / FORCE_EXIT)
-#                          - 入场 ADX 斜率 + recent-range 过滤
-#                          - 距中轴 max BUY depth
-#                          - rescue recenter / no_fill_timeout
-#  TURBO_ENABLED = False → 退化为原始 3-state 网格 (SCANNING/ACTIVE_GRID/EXIT_PENDING):
-#                          - 全部战术 gate 走 legacy 分支 (grid_bot 8 处 if 都退化)
-#                          - 底仓用 BASE_POSITION_RATIO (默认 0.40, 不是 TACTICAL 的 0.05)
-#                          - grid_engine.should_exit 直接触发 EXIT_PENDING (无 override)
-#                          - 入场只看 ADX/ATR/BB 三个条件 (无斜率 / range / depth 过滤)
-#
-#  这是用户面对的"单一开关". tactical_config.TACTICAL_GRID_ENABLED 默认绑这个值,
-#  但保留 env 覆盖 (TACTICAL_GRID_ENABLED=0 仍能精细关闭仅战术层).
-# ════════════════════════════════════════════
-import os as _os
-# 默认 OFF — 2026-05-15 严证伪通过, 详见 reports/tactical_proof_of_impossibility.md
-# 战术化代码全部保留 (EXPERIMENTAL); 实盘 / 回测默认走 V49 legacy 路径.
-TURBO_ENABLED: bool = _os.getenv("TURBO_ENABLED", "0").strip().lower() in (
-    "1", "true", "yes", "y", "on"
-)
-
-
-# ════════════════════════════════════════════
 #  标的
 # ════════════════════════════════════════════
 SYMBOL = "UVXY"           # QQQ-tuned 默认: "QQQ"
@@ -122,7 +95,7 @@ CURRENCY = "USD"
 # ════════════════════════════════════════════
 from typing import Optional as _Optional
 TOTAL_CAPITAL: _Optional[float] = None   # runtime 注入
-BACKTEST_DEFAULT_CAPITAL = 10000.0       # 仅作为 --capital argparse default
+BACKTEST_DEFAULT_CAPITAL = 2000.0        # 仅作为 --capital argparse default
 
 BASE_POSITION_RATIO = 0.40       # 底仓占比 (V47 = QQQ 默认值)
 GRID_CAPITAL_RATIO = 0.50        # 网格资金占比 (V47 = QQQ 默认值)
@@ -193,33 +166,6 @@ ENTRY_MIN_ATR_PCT = 0.020              # QQQ-tuned: 0.005
 ENTRY_MAX_ATR_PCT = 0.045              # QQQ-tuned: 0.025  (~UVXY p50)
 ENTRY_MAX_EMA_DEVIATION_ATR = 1.0      # QQQ-tuned: 1.5
 ENTRY_MAX_BB_WIDTH_PCT = 0.20          # QQQ-tuned: 0.10
-# S3: 入场加"实际震荡幅度"过滤 — 过去 N 根 bar 的 (max High - min Low) / ATR.
-# 设 0 关闭. 之前默认 2.0×ATR 实测在 base=0.40 长 session 框架下并无显著贡献,
-# 反而拒掉了一些 V49 能成功的 entry. 默认改 0, 留作 step2C 增强候选验证.
-ENTRY_RECENT_RANGE_LOOKBACK_BARS = int(
-    os.getenv("ENTRY_RECENT_RANGE_LOOKBACK_BARS", "20")
-)
-ENTRY_MIN_RECENT_RANGE_ATR = float(
-    os.getenv("ENTRY_MIN_RECENT_RANGE_ATR", "0.0")
-)
-# T1: ADX 斜率上行 → 拒绝入场. 防止入场在 "ranging 即将 break-out" 的临界点.
-# ENTRY_MAX_ADX_SLOPE: 最大允许的 ADX 单 bar 斜率 (正=ADX 上升).
-#   < 0 拒绝任何上升 (严格)
-#   = 0 拒绝明显上升
-#   > 0 允许小幅上升
-#   <= -100 关闭该 check
-# 默认改 -1000 (关闭) — 同 S3 理由, 待 step2C 验证.
-ENTRY_ADX_SLOPE_LOOKBACK_BARS = int(
-    os.getenv("ENTRY_ADX_SLOPE_LOOKBACK_BARS", "3")
-)
-ENTRY_MAX_ADX_SLOPE = float(
-    # 默认 -0.5 (sweep 最优): 拒绝 ADX 斜率 ≥ -0.5/bar 的入场.
-    # 5y 实测: 关闭 +44.08%, =0 +47.30%, =-0.3 +52.36%, =-0.5 +53.83%,
-    #          =-0.7 +49.50%, =-1.0 +0.28% (过严, 没 session 触发).
-    # 入场更挑剔 → 6 个 session 减少, 但 DD 从 16.33% 降到 13.69%, win 69.44%.
-    # 这是当前唯一被实测验证的"战术增强". 关闭设 -1000.
-    os.getenv("ENTRY_MAX_ADX_SLOPE", "-0.5")
-)
 ENTRY_MIN_DAILY_VOLUME_USD = 1.0e6     # 日均成交额下限 (USD)
 ENTRY_BLACKOUT_DAYS_BEFORE_EARNINGS = 7
 ENTRY_BLACKOUT_DAYS_AFTER_EARNINGS = 1
@@ -231,7 +177,13 @@ ENTRY_PRICE_BAND_ATR = float(os.getenv("ENTRY_PRICE_BAND_ATR", "1.25"))
 #   - T0+8h 再评估时 elapsed=2.0 > 1.0 → check_entry_timeout 触发回 SCANNING
 # 即"最多挂一个 4h bar"窗口, 短到与 SCANNING 几乎等价但保留一次额外 timing 机会.
 # 实盘观察后若发现 timing 命中比例过低可调大. 可通过环境变量覆盖.
-ENTRY_MAX_WAIT_BARS = float(os.getenv("ENTRY_MAX_WAIT_BARS", "12"))  # 2026-05-15: V49 default 12 恢复, walk-forward 验证过
+# ADX 斜率过滤 (entry_filter.py T1 增强, 2026-05-15 Phase 4.E 补回):
+# 拒绝 ADX 斜率 > 阈值 的入场 (ADX 正在上升意味着趋势形成中, 不利于网格).
+# 5y 实测: -1.0=+0.28%(过严, 几乎没 session), -0.5=+82.81%(最优), 关闭=+68.75%.
+# 设为 -1000 可关闭. 不在 config 中定义此参数时, entry_filter 默认 -1.0 (过严!).
+ENTRY_ADX_SLOPE_LOOKBACK_BARS = int(os.getenv("ENTRY_ADX_SLOPE_LOOKBACK_BARS", "3"))
+ENTRY_MAX_ADX_SLOPE = float(os.getenv("ENTRY_MAX_ADX_SLOPE", "-0.5"))
+ENTRY_MAX_WAIT_BARS = float(os.getenv("ENTRY_MAX_WAIT_BARS", "1.5"))
 
 # 浮点边界误差吸收带 (单位: bar). check_entry_timeout 对比 elapsed_bars 时使用,
 # 防止主循环调度漂移让 elapsed 略大于 ENTRY_MAX_WAIT_BARS 而提早超时,
@@ -247,12 +199,7 @@ ENTRY_EXECUTION_MAX_FAILURES = int(os.getenv("ENTRY_EXECUTION_MAX_FAILURES", "2"
 #  网格 (V47: 跟得上 UVXY 高频换向)
 # ════════════════════════════════════════════
 GRID_LEVELS = 6
-GRID_SPACING_ATR_MULTIPLIER = float(   # V49 walk-forward 最优 0.5
-    os.getenv("GRID_SPACING_ATR_MULTIPLIER", "0.5")
-)
-# 注: T2 实验 0.3 实测让 ret 变差 (gpnl 由 +$20 → -$412): spacing 收窄
-# 同样让 BUY 间距收窄, 浅回调就触发 BUY, 反弹不够触发 SELL, 反而扩大累积损失.
-# 真正的 SELL 触发率改善要靠 T3 (距中轴 1.0×ATR 不再加 BUY), 不靠改 spacing.
+GRID_SPACING_ATR_MULTIPLIER = 0.5      # V49 (full tune): 0.5 | V48: 0.4 | V47: 0.5 | QQQ-tuned: 0.60
 GRID_MIN_SPACING_PCT = 0.012           # QQQ-tuned: 0.008
 GRID_MAX_SPACING_PCT = 0.06            # QQQ-tuned: 0.04
 GRID_CENTER_EMA_PERIOD = 20

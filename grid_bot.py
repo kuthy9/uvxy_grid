@@ -23,7 +23,7 @@ from grid_engine import DynamicGridEngine
 from interfaces import Clock, Executor
 from pnl_tracker import PnLTracker
 from risk_manager import RiskManager
-from state_machine import StateMachine, SystemState
+from state_machine import StateMachine, SystemState, is_grid_state
 from trade_logger import TradeDatabase
 
 ET = ZoneInfo("America/New_York")
@@ -75,7 +75,11 @@ class GridBot:
                  state_machine: StateMachine,
                  entry_filter: EntryFilter,
                  data_fetcher,
-                 strategy_df_days: int = None):
+                 strategy_df_days: int = None,
+                 # 2026-05-15 Phase 4.E: 多标的支持. 单标的不传, fallback config.TOTAL_CAPITAL.
+                 allocated_capital: float = None,
+                 symbol: str = None,
+                 capital_provider=None):
         self.clock = clock
         self.executor = executor
         self.db = db
@@ -85,6 +89,9 @@ class GridBot:
         self.entry_filter = entry_filter
         self.data_fetcher = data_fetcher  # 需要有 get_strategy_data(symbol, days)
         self.strategy_df_days = strategy_df_days or config.HISTORY_LOOKBACK_DAYS
+        self._allocated_capital = allocated_capital
+        self._symbol = symbol or config.SYMBOL
+        self._capital_provider = capital_provider  # 现阶段未实际使用, 仅 signature 兼容
 
         self.grid: Optional[DynamicGridEngine] = None
         self._running = False
@@ -98,6 +105,20 @@ class GridBot:
         # 连续 _execute_entry 失败计数; 达到 config.ENTRY_EXECUTION_MAX_FAILURES
         # 时自动回 SCANNING, 避免 waiting_entry 长期卡死.
         self._entry_execution_failures = 0
+
+    def _capital(self) -> float:
+        """返回本 bot 的资金参考. 多标的传 allocated_capital, 单标的 fallback TOTAL_CAPITAL.
+
+        2026-05-15 Phase 4.E: 加入此 helper 避免 sub-bot 直接读 config.TOTAL_CAPITAL
+        (那是全账户值, 多标的会 oversubscribe).
+
+        getattr 安全访问: __new__-style 测试夹具不走 __init__, 故 _allocated_capital
+        可能未设置; 用 getattr(..., None) 而非裸属性访问, 保证测试不崩溃.
+        """
+        allocated = getattr(self, "_allocated_capital", None)
+        if allocated is not None:
+            return float(allocated)
+        return float(config.require_total_capital())
 
     # ───────────────────────────────
     #  生命周期
@@ -162,7 +183,7 @@ class GridBot:
     def _try_restore_grid(self):
         """当状态机处于 ACTIVE_GRID / EXIT_PENDING 时, 尝试从快照恢复网格引擎."""
         state = self.state_machine.state
-        if state not in (SystemState.ACTIVE_GRID, SystemState.EXIT_PENDING):
+        if not (is_grid_state(state) or state == SystemState.EXIT_PENDING):
             return
         path = _grid_state_path(self.db.db_path)
         if not os.path.exists(path):
@@ -264,7 +285,7 @@ class GridBot:
             )
 
         # ── 漂移 #2: 本地认为有仓但 IBKR 空仓 ──
-        if real_shares < 0.0001 and state in (SystemState.ACTIVE_GRID, SystemState.EXIT_PENDING):
+        if real_shares < 0.0001 and (is_grid_state(state) or state == SystemState.EXIT_PENDING):
             self.db.log_risk_event(
                 "RECONCILE_DRIFT",
                 f"IBKR 空仓但本地 state={state.value} 含 FIFO {fifo_qty:.4f}",
@@ -406,7 +427,8 @@ class GridBot:
             self._handle_scanning()
         elif state == SystemState.WAITING_ENTRY:
             self._handle_waiting_entry()
-        elif state == SystemState.ACTIVE_GRID:
+        elif is_grid_state(state):
+            # 2026-05-15 Phase 4.E: 兼容 OFFENSIVE_GRID / DEFENSIVE_GRID / ACTIVE_GRID
             self._handle_active_grid()
         elif state == SystemState.EXIT_PENDING:
             self._handle_exit_pending()
@@ -653,7 +675,7 @@ class GridBot:
                     logger.warning(f"log_risk_event 失败 (非致命): {e}")
             return False
 
-        base_capital = config.TOTAL_CAPITAL * config.BASE_POSITION_RATIO
+        base_capital = self._capital() * config.BASE_POSITION_RATIO
         base_shares = config.round_quantity(base_capital / current_price)
         if base_shares <= 0:
             logger.error(f"底仓数量为 0 (资金${base_capital:.2f} 价${current_price:.2f}), "
@@ -830,7 +852,7 @@ class GridBot:
         # 3. 风控
         pos = self.executor.get_position_details()
         equity = self.executor.get_account_summary().get(
-            "NetLiquidation", config.TOTAL_CAPITAL
+            "NetLiquidation", self._capital()
         )
         risk_check = self.risk.can_trade(current_price, equity, pos["market_value"])
 
@@ -843,7 +865,7 @@ class GridBot:
             self._check_dynamic_adjustment(current_price)
 
         # 5. 下单
-        if risk_check and self.state_machine.state == SystemState.ACTIVE_GRID and self.grid:
+        if risk_check and is_grid_state(self.state_machine.state) and self.grid:
             signals = self.grid.check_signals(current_price)
             # 关键: SELL 的可卖量以 FIFO 队列为权威
             # (而非 pos - _base_position_shares, 后者在状态漂移时可能多算)
