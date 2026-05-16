@@ -1,17 +1,23 @@
 """
-state_machine.py — 系统状态机
+state_machine.py — 系统状态机 (v3, 战术网格扩展)
 
-四种状态:
-  1. SCANNING       — 扫描中，等待入场条件满足
-  2. WAITING_ENTRY  — 条件满足，等待理想入场价
-  3. ACTIVE_GRID    — 网格运行中
-  4. EXIT_PENDING   — 退出中(已撤单，等待持仓自然减少)
+六种状态 (v3 起):
+  1. SCANNING        — 扫描中, 等待入场条件满足
+  2. WAITING_ENTRY   — 条件满足, 等待理想入场价
+  3. OFFENSIVE_GRID  — 进攻型网格运行中 (允许买/卖)
+  4. DEFENSIVE_GRID  — 防守型网格 (停止补仓, 只允许卖出 / 反弹减仓)
+  5. EXIT_PENDING    — 退出中 (已撤单, 等待持仓清理)
+  6. COOLDOWN        — 上一轮退出后冷却, 暂不开新 session
 
-状态转换由 evaluate() 方法驱动，外部循环每次调用即可。
+向后兼容:
+  - 保留 SystemState.ACTIVE_GRID = "active_grid" 作为旧 DB 行的合法值,
+    load_state 时透明翻译成 OFFENSIVE_GRID. 新代码不再产出 "active_grid" 字符串.
+
+状态转换由 evaluate() 方法驱动, 外部循环每次调用即可.
 
 持久化:
   save_state(db_path) / load_state(db_path) 把 StateContext 落盘到 state_machine_state 表,
-  实现重启后状态机状态的连续性。
+  实现重启后状态机状态的连续性. 旧 DB schema (没有新字段) 完全兼容; 新加字段都是 nullable.
 """
 
 import logging
@@ -29,8 +35,33 @@ logger = logging.getLogger("GridTrader.StateMachine")
 class SystemState(Enum):
     SCANNING = "scanning"
     WAITING_ENTRY = "waiting_entry"
-    ACTIVE_GRID = "active_grid"
+    # 战术网格三态
+    OFFENSIVE_GRID = "offensive_grid"
+    DEFENSIVE_GRID = "defensive_grid"
+    COOLDOWN = "cooldown"
     EXIT_PENDING = "exit_pending"
+    # 旧版兼容: 仅供 enum lookup 与 import 兼容, 新代码不应再创建此值.
+    # load_state 会把 DB 中的 "active_grid" 翻译成 OFFENSIVE_GRID.
+    ACTIVE_GRID = "active_grid"
+
+
+# 所有 "网格存在 + 主循环要走网格处理" 的状态.
+# EXIT_PENDING 不算在内 — 它有专门的清仓 handler.
+GRID_MODE_STATES = frozenset({
+    SystemState.OFFENSIVE_GRID,
+    SystemState.DEFENSIVE_GRID,
+    SystemState.ACTIVE_GRID,  # 旧值, 防御性留着 — 实践中 load_state 已翻译过.
+})
+
+
+def is_grid_state(state: SystemState) -> bool:
+    """`state` 是否处于"网格已建仓且仍在运行"阶段."""
+    return state in GRID_MODE_STATES
+
+
+def is_position_holding_state(state: SystemState) -> bool:
+    """`state` 是否还在持仓 (含 EXIT_PENDING). SCANNING/WAITING_ENTRY/COOLDOWN 视为空仓."""
+    return state in GRID_MODE_STATES or state == SystemState.EXIT_PENDING
 
 
 @dataclass
@@ -97,14 +128,24 @@ class StateMachine:
         # 状态进入时的初始化
         if new_state == SystemState.WAITING_ENTRY:
             self.context.entry_window_started_at = now.isoformat()
-        elif new_state == SystemState.ACTIVE_GRID:
-            self.context.grid_active_since = now.isoformat()
-            self.context.total_grid_sessions += 1
+        elif new_state in (SystemState.OFFENSIVE_GRID, SystemState.ACTIVE_GRID):
+            # 第一次从 WAITING_ENTRY 切到 grid 才计 session;
+            # OFFENSIVE ↔ DEFENSIVE 来回切换不重复计.
+            if old in (SystemState.WAITING_ENTRY, SystemState.SCANNING):
+                self.context.grid_active_since = now.isoformat()
+                self.context.total_grid_sessions += 1
             self.context.entry_window_started_at = None
+        elif new_state == SystemState.DEFENSIVE_GRID:
+            # 来自 OFFENSIVE → DEFENSIVE 仍属于同一 session, 不递增 total_grid_sessions.
+            # 仅记录 entered_at; grid_active_since 保留 (用于 age 计算).
+            pass
         elif new_state == SystemState.EXIT_PENDING:
             self.context.exit_initiated_at = now.isoformat()
             self.context.exit_reason = reason
             self.context.total_exits += 1
+        elif new_state == SystemState.COOLDOWN:
+            # 进入 COOLDOWN: 清掉 grid 上下文, 但保留 exit_reason 供日志/报告
+            self.context.grid_active_since = None
         elif new_state == SystemState.SCANNING:
             # 重置所有临时状态
             self.context.entry_window_started_at = None
@@ -163,24 +204,62 @@ class StateMachine:
         return False
 
     def on_grid_active(self, now: Optional[datetime] = None):
-        """从WAITING_ENTRY → ACTIVE_GRID (建仓成功后调用)"""
+        """从 WAITING_ENTRY → OFFENSIVE_GRID (建仓成功后调用).
+
+        v3 起目标态是 OFFENSIVE_GRID. 旧调用方代码无需改动 — 这里 dispatch 即可."""
         if self.state == SystemState.WAITING_ENTRY:
-            self.transition_to(SystemState.ACTIVE_GRID, "建仓完成", now=now)
+            self.transition_to(SystemState.OFFENSIVE_GRID, "建仓完成", now=now)
+
+    def on_enter_defensive(self, reason: str,
+                           now: Optional[datetime] = None):
+        """OFFENSIVE_GRID → DEFENSIVE_GRID."""
+        if self.state in (SystemState.OFFENSIVE_GRID, SystemState.ACTIVE_GRID):
+            self.transition_to(SystemState.DEFENSIVE_GRID, reason, now=now)
+
+    def on_back_to_offensive(self, reason: str = "",
+                             now: Optional[datetime] = None):
+        """DEFENSIVE_GRID → OFFENSIVE_GRID (例如反弹回到 EMA 之上, 风险评分回落).
+        当前业务保守: 一旦 DEFENSIVE 就只允许 EXIT, 不主动回 OFFENSIVE.
+        保留 API 供未来策略迭代."""
+        if self.state == SystemState.DEFENSIVE_GRID:
+            self.transition_to(SystemState.OFFENSIVE_GRID, reason or "回到 OFFENSIVE", now=now)
 
     def on_exit_signal(self, should_exit: bool, reason: str = "",
                        now: Optional[datetime] = None):
-        """处理退出信号"""
-        if self.state != SystemState.ACTIVE_GRID:
+        """处理退出信号 — OFFENSIVE / DEFENSIVE / 旧 ACTIVE_GRID 都可触发."""
+        if self.state not in (SystemState.OFFENSIVE_GRID, SystemState.DEFENSIVE_GRID,
+                              SystemState.ACTIVE_GRID):
             return None
         if should_exit:
             self.transition_to(SystemState.EXIT_PENDING, reason, now=now)
             return "INITIATE_EXIT"
         return None
 
-    def on_exit_complete(self, now: Optional[datetime] = None):
-        """退出完成（持仓清理完毕）"""
-        if self.state == SystemState.EXIT_PENDING:
-            self.transition_to(SystemState.SCANNING, "退出完成，重新扫描", now=now)
+    def on_exit_complete(self, now: Optional[datetime] = None,
+                         enter_cooldown_bars: float = 0.0,
+                         cooldown_reason: str = ""):
+        """退出完成 (持仓清理完毕).
+
+        enter_cooldown_bars > 0 时: EXIT_PENDING → COOLDOWN, grid_bot 后续根据
+        session_manager.in_cooldown 决定何时回 SCANNING.
+        否则按旧语义直接回 SCANNING.
+        """
+        if self.state != SystemState.EXIT_PENDING:
+            return
+        if enter_cooldown_bars > 0:
+            self.transition_to(
+                SystemState.COOLDOWN,
+                f"退出完成, 进入 cooldown {enter_cooldown_bars:.1f}bars" +
+                (f" ({cooldown_reason})" if cooldown_reason else ""),
+                now=now
+            )
+        else:
+            self.transition_to(SystemState.SCANNING, "退出完成, 重新扫描", now=now)
+
+    def on_cooldown_complete(self, now: Optional[datetime] = None):
+        """COOLDOWN → SCANNING. 由 grid_bot 看 session_manager.remaining_cooldown_bars 判断."""
+        if self.state == SystemState.COOLDOWN:
+            self.transition_to(SystemState.SCANNING, "cooldown 结束", now=now)
 
     def on_recenter(self, now: Optional[datetime] = None):
         """记录中轴重置"""
@@ -193,12 +272,20 @@ class StateMachine:
     # ──────────────────────────────
 
     def get_check_interval_sec(self) -> int:
-        """根据当前状态返回应该的检查频率 — SCANNING/WAITING 动态随 STRATEGY_INTERVAL"""
+        """根据当前状态返回应该的检查频率 — SCANNING/WAITING 动态随 STRATEGY_INTERVAL.
+
+        OFFENSIVE/DEFENSIVE 共用 ACTIVE_CHECK_INTERVAL_SEC (1 分钟级), 这样
+        DEFENSIVE 仍可及时捕捉反弹卖出机会. COOLDOWN 与 SCANNING 同步, 按
+        策略周期 sleep — 没必要每分钟检查.
+        """
         return {
             SystemState.SCANNING: config.scanning_interval_sec(),
             SystemState.WAITING_ENTRY: config.waiting_interval_sec(),
+            SystemState.OFFENSIVE_GRID: config.ACTIVE_CHECK_INTERVAL_SEC,
+            SystemState.DEFENSIVE_GRID: config.ACTIVE_CHECK_INTERVAL_SEC,
             SystemState.ACTIVE_GRID: config.ACTIVE_CHECK_INTERVAL_SEC,
             SystemState.EXIT_PENDING: config.ACTIVE_CHECK_INTERVAL_SEC,
+            SystemState.COOLDOWN: config.scanning_interval_sec(),
         }.get(self.state, 60)
 
     # ──────────────────────────────
@@ -259,8 +346,20 @@ class StateMachine:
         if not row:
             return False
         try:
+            raw_state = row[0]
+            # 向后兼容: 旧 DB 中 "active_grid" 翻译成 OFFENSIVE_GRID.
+            # SystemState 仍保留 ACTIVE_GRID 字面值, 这里显式映射避免运行期
+            # 出现两个具有相同语义的 enum 流转, 让后续业务只看 OFFENSIVE/DEFENSIVE.
+            if raw_state == SystemState.ACTIVE_GRID.value:
+                logger.info(
+                    "  ↪︎ 旧 active_grid 状态已翻译为 offensive_grid (兼容)"
+                )
+                restored_state = SystemState.OFFENSIVE_GRID
+            else:
+                restored_state = SystemState(raw_state)
+
             self.context = StateContext(
-                current_state=SystemState(row[0]),
+                current_state=restored_state,
                 state_entered_at=row[1] or "",
                 last_evaluation_time=row[2],
                 entry_window_started_at=row[3],
