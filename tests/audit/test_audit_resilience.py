@@ -125,3 +125,32 @@ def test_check_d_warn_when_event_table_stale(tmp_path):
     r = A.check_d_sqlite(db_path=db, freshness_hours=6.0, market_hours_only=False)
     assert r.status == "WARN"
     assert "stale" in r.observed.lower() or "old" in r.observed.lower()
+
+
+def test_check_e_ok_when_both_files_parse(tmp_path):
+    grid = tmp_path / "trades.db.grid.json"
+    base = tmp_path / "trades.db.base_shares.txt"
+    grid.write_text('{"center": 12.3, "levels": []}')
+    base.write_text("42\n")
+    r = A.check_e_json_snapshots(grid_json=grid, base_shares=base)
+    assert r.code == "E"
+    assert r.status == "OK"
+
+
+def test_check_e_warn_when_grid_missing(tmp_path):
+    grid = tmp_path / "missing.json"
+    base = tmp_path / "trades.db.base_shares.txt"
+    base.write_text("0\n")
+    r = A.check_e_json_snapshots(grid_json=grid, base_shares=base)
+    assert r.status == "WARN"
+    assert "grid.json" in r.observed.lower() or "grid" in r.observed.lower()
+
+
+def test_check_e_fail_when_grid_unparseable(tmp_path):
+    grid = tmp_path / "trades.db.grid.json"
+    base = tmp_path / "trades.db.base_shares.txt"
+    grid.write_text("{not valid json")
+    base.write_text("0\n")
+    r = A.check_e_json_snapshots(grid_json=grid, base_shares=base)
+    assert r.status == "FAIL"
+    assert "json" in r.observed.lower()

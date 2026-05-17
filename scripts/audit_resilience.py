@@ -184,6 +184,48 @@ def check_d_sqlite(db_path: Path, freshness_hours: float,
     )
 
 
+def check_e_json_snapshots(grid_json: Path, base_shares: Path) -> CheckResult:
+    issues: list[str] = []
+    warns:  list[str] = []
+    fails:  list[str] = []
+
+    if not grid_json.exists():
+        warns.append(f"grid.json absent at {grid_json} (ok before first ACTIVE_GRID)")
+    else:
+        try:
+            json.loads(grid_json.read_text())
+        except json.JSONDecodeError as e:
+            fails.append(f"grid.json parse error: {e}")
+
+    if not base_shares.exists():
+        warns.append(f"base_shares.txt absent at {base_shares} (ok before any base entry)")
+    else:
+        try:
+            float(base_shares.read_text().strip() or "0")
+        except ValueError as e:
+            fails.append(f"base_shares.txt not numeric: {e}")
+
+    if fails:
+        return CheckResult(
+            "E", "json-snapshots", "FAIL",
+            observed="; ".join(fails),
+            expected="grid.json parseable; base_shares.txt numeric",
+            suggested_action="inspect file contents; may indicate mid-write crash",
+        )
+    if warns:
+        return CheckResult(
+            "E", "json-snapshots", "WARN",
+            observed="; ".join(warns),
+            expected="files exist (or expected-absent if bot never reached ACTIVE_GRID)",
+            suggested_action="verify against current state machine phase",
+        )
+    return CheckResult(
+        "E", "json-snapshots", "OK",
+        observed="grid.json + base_shares.txt present & parseable",
+        expected="—", suggested_action="",
+    )
+
+
 # ─────────────────────────── CLI ───────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -210,6 +252,10 @@ def main(argv: list[str] | None = None) -> int:
         freshness_hours=args.freshness_hours,
         market_hours_only=True,
     ))
+
+    grid_json = Path(args.grid_json) if args.grid_json else Path(str(args.db) + ".grid.json")
+    base_shares = Path(args.base_shares) if args.base_shares else Path(str(args.db) + ".base_shares.txt")
+    results.append(check_e_json_snapshots(grid_json=grid_json, base_shares=base_shares))
 
     render_table(results)
     out = Path(args.out) if args.out else Path("runtime/audit") / (
