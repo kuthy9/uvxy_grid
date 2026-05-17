@@ -46,22 +46,33 @@ main.py:
 - DSM **time zone** = compose `TZ` = `America/New_York`.
 - (Optional, out of scope this round) UPS configured for safe shutdown.
 
-## 3. Gap log (from latest audit run)
+## 3. Gap log (from latest audit run, post B1–B3 fixes)
 
 > Generated from `runtime/audit/<latest>.json`. Update by re-running audit + replacing this section.
 
 | code | status | name | observed | expected | suggested_action |
 |---|---|---|---|---|---|
-| A | WARN | host | manual host checklist not acknowledged | manual verification on Synology DSM | verify each item on DSM, then re-run with --ack-host-checked |
-| C | WARN | boot-loop | main.py exits on connect failure with no backoff token nearby | stepped sleep before sys.exit to avoid restart-loop log flood | DEFERRED per spec P1 (requires main.py edit); record in docs/resilience.md gap log |
-| D | FAIL | sqlite | db file not found: runtime/trades.db (cascading: this dev branch never ran the bot) | SQLite file present + readable + integrity_check ok | confirm DB_FILE env / volume mount on Synology |
-| E | WARN | json-snapshots | grid.json + base_shares.txt absent (expected before first ACTIVE_GRID) | files exist (or expected-absent if bot never reached ACTIVE_GRID) | verify against current state machine phase |
-| G | WARN | reconcile-retry | _reconcile_with_broker has no retry/attempt token | retry on reqAllOpenOrders empty-result window | DEFERRED per spec P1 — record in docs/resilience.md gap log |
-| H | WARN | ibkr-reconnect | no disconnectedEvent subscription in ibkr_executor.py | subscribe disconnectedEvent + explicit reconnect path | DEFERRED per spec P1 |
-| I | WARN | data-scripts | data scripts not auto-managed: ['multi_pull.py', 'vxx.py', 'vxx_1d.py', 'vxx_1h.py'] | data scripts ideally idempotent + cron-managed | DEFERRED per spec P1 — record in gap log; cronify with catch-up |
-| K | WARN | heartbeat | db not found (cascading from D) | db file present | check DB_FILE / volume mount |
+| A | OK (with --ack-host-checked) | host | operator acknowledged manual host checklist | manual verification on Synology DSM | re-run with --ack-host-checked after DSM changes |
+| B | OK | compose | restart_always=2, healthcheck retries=20 | — | — |
+| C | OK | boot-loop | sys.exit paths backed off (B1 fix applied) | — | — |
+| D | FAIL | sqlite | db file not found: runtime/trades.db (env-cascading: dev branch never ran the bot; on production Synology with `--db ./runtime/trades_uvxy.db` this is OK) | SQLite file present + readable + integrity_check ok | confirm DB_FILE env / volume mount on Synology |
+| E | WARN | json-snapshots | grid.json + base_shares.txt absent (env-cascading from D) | files exist (or expected-absent if bot never reached ACTIVE_GRID) | verify against current state machine phase |
+| F | OK | main-loop-except | main loop has broad Exception handler | — | — |
+| G | OK | reconcile-retry | retry tokens present in reconcile body (B2 fix applied) | — | — |
+| H | OK | ibkr-reconnect | disconnectedEvent referenced (B3 fix applied) | — | — |
+| I | WARN | data-scripts | data scripts not cron-managed: data/multi_pull.py, data/vxx.py, etc. | data scripts ideally idempotent + cron-managed | **NOT FIXED** — investigation 2026-05-17 confirmed data/ scripts are research-only (no live trading code reads data/). Operational hygiene only, not a trading risk. |
+| J | OK | disk-log | log size and disk free within bounds | — | — |
+| K | WARN | heartbeat | db not found (env-cascading from D) | db file present | check DB_FILE / volume mount |
 
-**All WARN/FAIL items whose suggested action says "DEFERRED per spec P1" are deferred.** They require core trading file edits; the user must approve a separate round to implement them.
+### B1 / B2 / B3 fix history (2026-05-17)
+
+| code | before | fix | commit |
+|---|---|---|---|
+| C | main.py exited on connect failure with no backoff → `restart: always` looped at ~1Hz, flooding Synology log | New `_exit_with_backoff(code)` helper sleeps `BOOT_RETRY_BACKOFF_SEC` (default 30s) before `sys.exit` on the 4 connect-related exit paths. `sys.exit(2)` for config errors untouched (should hard-exit). 5 unit tests. | `feature/audit-deferred-fixes` 29cc38b |
+| G | `_reconcile_with_broker` called `executor.reconcile_on_startup()` once; an IBKR Gateway boot-window false-empty would trigger drift #2 → clear local FIFO → REAL MONEY risk on restart | New `_fetch_reconcile_with_retry(max_attempts=3, backoff_sec=(2,5,10))` helper retries only when (a) `is_position_holding_state(state)` AND (b) broker reports empty. Other cases accepted immediately. 8 unit tests. | `feature/audit-deferred-fixes` 33cc056 |
+| H | `IBKRExecutor` never subscribed `disconnectedEvent` → mid-session IBKR drops went unobserved at the application layer; main loop kept hitting the same not-connected error every 30s | `connect()` subscribes `disconnectedEvent` once (idempotent); `_on_disconnected` handler clears `_market_data_type_effective` cache + logs (does NOT block ib_insync's asyncio loop). New `ensure_connected()` thin reconnect-if-needed helper for callers. `disconnect()` marks `_intentional_disconnect=True` BEFORE calling `self.ib.disconnect()` to win the race with the event. 12 unit tests. | `feature/audit-deferred-fixes` 68978a1 |
+
+**Remaining deferred items**: I (data scripts) is NOT a trading-correctness issue; documented as operational hygiene only. D / E / K are environmental state (no production DB on dev branch), not bugs. A clears when operator runs `--ack-host-checked`.
 
 ## 4. Residual risks (audit cannot verify these)
 

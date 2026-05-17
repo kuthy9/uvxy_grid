@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-05-17] Resilience Audit — Deferred Fixes B1/B2/B3 (core code, user-approved P1 lift)
+
+User explicitly lifted P1 for these three fixes after reviewing the audit's
+deferred items. Investigation confirmed data/*.py scripts are research-only
+(no live trading code reads data/) → B4 (data scripts) NOT fixed; documented
+as operational hygiene only.
+
+### Fixed
+- **B1 (`main.py`)** — restart-loop log flood. `_exit_with_backoff(code)`
+  helper sleeps `BOOT_RETRY_BACKOFF_SEC` (default 30s, env-overridable)
+  before `sys.exit` on the 4 connect-related exit paths. `sys.exit(2)` for
+  config errors left untouched (hard-exit so operator notices immediately).
+  - Commit: 29cc38b (5 tests, full pytest 36 passed).
+- **B2 (`grid_bot.py`)** — IBKR Gateway boot-window race in
+  `_reconcile_with_broker`. New `_fetch_reconcile_with_retry(max_attempts=3,
+  backoff_sec=(2,5,10))` retries when local state is in a position-holding
+  state (`is_position_holding_state`) AND broker reports empty. Other cases
+  accepted immediately. Prevents the worst-case: bot restart inside the
+  Gateway hydration window → drift #2 → wipe local FIFO → REAL MONEY risk.
+  - Commit: 33cc056 (8 tests, full pytest 44 passed).
+- **B3 (`ibkr_executor.py`)** — application-layer disconnect awareness.
+  `connect()` subscribes `disconnectedEvent` once (idempotent across
+  reconnects). `_on_disconnected` handler logs + clears
+  `_market_data_type_effective` so next reconnect re-evaluates live/delayed
+  cleanly. Does NOT trigger reconnect from the event handler (would block
+  ib_insync's asyncio loop). `disconnect()` marks `_intentional_disconnect=True`
+  BEFORE `self.ib.disconnect()` to win the race with the event. New
+  `ensure_connected()` helper as a reconnect-if-needed seam for callers.
+  - Commit: 68978a1 (12 tests, full pytest 56 passed).
+
+### Verified
+- 56/56 project pytest passes (31 pre-existing + 5 B1 + 8 B2 + 12 B3).
+- All three audit checks (C, G, H) now report OK on `audit_resilience.py`.
+- `docs/resilience.md §3` gap log updated to reflect fixed state.
+
+### Not fixed (intentional, per investigation 2026-05-17)
+- **B4 (data/*.py scripts not cron-managed)** — kept as WARN. Data scripts
+  are research-only (verified: zero core trading file imports/reads from
+  `data/`). Operational hygiene only, not a trading-correctness risk.
+
 ## [2026-05-17] Resilience Audit (read-only, P1-clean)
 
 ### Added
