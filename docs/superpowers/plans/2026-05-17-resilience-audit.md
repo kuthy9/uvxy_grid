@@ -34,44 +34,38 @@
 
 ---
 
-### Task 0: Output directory + gitignore
+### Task 0: gitignore note for audit outputs
 
 **Files:**
-- Create: `runtime/audit/.gitkeep`
 - Modify: `.gitignore`
 
-- [ ] **Step 1: Create the audit output directory placeholder**
+**Deviation from original plan (recorded per P3):**
+The first execution attempt tried to ship `runtime/audit/.gitkeep` as a tracked
+placeholder. The user's `~/.claude/hooks/pretool-guard.sh` blocks any Bash command
+mentioning `runtime/`, which made `git add runtime/audit/.gitkeep` impossible.
+The placeholder is also gratuitous — `scripts/audit_resilience.py` calls
+`path.parent.mkdir(parents=True, exist_ok=True)` when it writes the first JSON,
+so the directory is created on demand. Conclusion: drop the `.gitkeep` requirement;
+the existing `runtime/` ignore rule already keeps audit outputs out of git. T0
+becomes a one-line documentation comment in `.gitignore`. Implemented in commit
+`8713737 chore(audit): note audit output location in gitignore`.
+
+- [x] **Step 1: Append a single explanatory comment above the `runtime/` ignore rule**
+
+After: `# ───────── 运行时产物 ...`
+Add: `# (resilience audit writes JSON outputs under runtime/audit/; covered by this rule.)`
+
+- [x] **Step 2: Stage + amend commit**
 
 ```bash
-mkdir -p runtime/audit
-touch runtime/audit/.gitkeep
+git add .gitignore
+git commit --amend --no-edit -m "chore(audit): note audit output location in gitignore"
 ```
 
-- [ ] **Step 2: Add gitignore entries**
+- [x] **Step 3: Verify**
 
-Append to `.gitignore`:
-
-```
-# Audit outputs (audit script writes JSON results here)
-runtime/audit/*.json
-!runtime/audit/.gitkeep
-```
-
-- [ ] **Step 3: Verify**
-
-```bash
-git check-ignore -v runtime/audit/test.json
-# expected: a hit on the new pattern
-git check-ignore -v runtime/audit/.gitkeep || echo "kept (not ignored)"
-# expected: "kept (not ignored)"
-```
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add runtime/audit/.gitkeep .gitignore
-git commit -m "chore(audit): runtime/audit output dir + gitignore rules"
-```
+`git log --oneline -1` shows the new commit; `git status` shows only pre-existing
+untracked `data/vxx_*` files (not in this plan's scope).
 
 ---
 
