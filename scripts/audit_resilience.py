@@ -81,6 +81,109 @@ def write_json(results: list[CheckResult], path: Path) -> None:
     path.write_text(json.dumps(payload, indent=2))
 
 
+# ─────────────────────────── Checks ───────────────────────────
+
+EXPECTED_TABLES = [
+    "state_machine_state",
+    "state_transitions",
+    "risk_events",
+    "risk_state",
+    "trades",
+    "daily_snapshots",
+    "pnl_fifo_queue",
+    "pnl_closes",
+]
+
+APPEND_ONLY_EVENT_TABLES = ["state_transitions", "risk_events", "trades"]
+
+
+def _is_market_hours(now: datetime) -> bool:
+    ny = now.astimezone(ZoneInfo("America/New_York"))
+    if ny.weekday() >= 5:
+        return False
+    start = ny.replace(hour=9, minute=30, second=0, microsecond=0)
+    end   = ny.replace(hour=16, minute=0, second=0, microsecond=0)
+    return start <= ny <= end
+
+
+def check_d_sqlite(db_path: Path, freshness_hours: float,
+                   market_hours_only: bool = True) -> CheckResult:
+    if not Path(db_path).exists():
+        return CheckResult(
+            "D", "sqlite", "FAIL",
+            observed=f"db file not found: {db_path}",
+            expected="SQLite file present + readable + integrity_check ok",
+            suggested_action="confirm DB_FILE env / volume mount on Synology",
+        )
+
+    uri = f"file:{db_path}?mode=ro&immutable=0"
+    try:
+        with sqlite3.connect(uri, uri=True) as conn:
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            present = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            missing = [t for t in EXPECTED_TABLES if t not in present]
+
+            stale: list[str] = []
+            now = datetime.now(ZoneInfo("America/New_York"))
+            if (not market_hours_only) or _is_market_hours(now):
+                for t in APPEND_ONLY_EVENT_TABLES:
+                    if t in missing:
+                        continue
+                    row = conn.execute(
+                        f"SELECT MAX(timestamp) FROM {t}"
+                    ).fetchone()
+                    newest = row[0] if row else None
+                    if newest is None:
+                        continue
+                    try:
+                        ts = datetime.fromisoformat(newest)
+                    except ValueError:
+                        continue
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=ZoneInfo("America/New_York"))
+                    delta = now - ts
+                    if delta > timedelta(hours=freshness_hours):
+                        stale.append(f"{t} newest {ts.isoformat()} ({delta} ago)")
+    except sqlite3.DatabaseError as e:
+        return CheckResult(
+            "D", "sqlite", "FAIL",
+            observed=f"DatabaseError: {e}", expected="readable SQLite db",
+            suggested_action="check DB file corruption / permissions",
+        )
+
+    if integrity != "ok":
+        return CheckResult(
+            "D", "sqlite", "FAIL",
+            observed=f"integrity_check={integrity}",
+            expected="integrity_check=ok",
+            suggested_action="restore from backup; investigate prior crash",
+        )
+    if missing:
+        return CheckResult(
+            "D", "sqlite", "WARN",
+            observed=f"missing tables: {missing}",
+            expected=f"all of {EXPECTED_TABLES}",
+            suggested_action="confirm main bot has run at least once "
+                             "so trade_logger/state_machine/etc. have created tables",
+        )
+    if stale:
+        return CheckResult(
+            "D", "sqlite", "WARN",
+            observed="stale event tables: " + "; ".join(stale),
+            expected=f"newest row within {freshness_hours}h during market hours",
+            suggested_action="check main bot heartbeat and IBKR connection",
+        )
+
+    return CheckResult(
+        "D", "sqlite", "OK",
+        observed=f"integrity ok, {len(EXPECTED_TABLES)} tables present, "
+                 f"event tables fresh",
+        expected="—", suggested_action="",
+    )
+
+
 # ─────────────────────────── CLI ───────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -101,8 +204,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="JSON output path; default runtime/audit/<ts>.json")
     args = parser.parse_args(argv)
 
-    # Tasks 2..8 will register check functions here.
     results: list[CheckResult] = []
+    results.append(check_d_sqlite(
+        db_path=Path(args.db),
+        freshness_hours=args.freshness_hours,
+        market_hours_only=True,
+    ))
 
     render_table(results)
     out = Path(args.out) if args.out else Path("runtime/audit") / (

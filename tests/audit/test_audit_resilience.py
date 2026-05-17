@@ -1,6 +1,7 @@
 """Tests for scripts/audit_resilience.py — read-only resilience audit."""
 import json
 from pathlib import Path
+import sqlite3
 import sys
 
 # Make scripts/ importable as a package-less module
@@ -60,3 +61,67 @@ def test_write_json_creates_file(tmp_path):
     loaded = json.loads(out.read_text())
     assert loaded["overall"]["exit_code"] == 0
     assert loaded["checks"][0]["code"] == "A"
+
+
+EXPECTED_TABLES = [
+    "state_machine_state",
+    "state_transitions",
+    "risk_events",
+    "risk_state",
+    "trades",
+    "daily_snapshots",
+    "pnl_fifo_queue",
+    "pnl_closes",
+]
+
+
+def _make_good_db(path):
+    """Create a SQLite file that the audit should report OK against."""
+    with sqlite3.connect(path) as conn:
+        for t in EXPECTED_TABLES:
+            conn.execute(f"CREATE TABLE {t} (id INTEGER PRIMARY KEY, timestamp TEXT, updated_at TEXT)")
+        from datetime import datetime
+        now_iso = datetime.now().isoformat()
+        for t in ("state_transitions", "risk_events", "trades"):
+            conn.execute(f"INSERT INTO {t}(timestamp) VALUES (?)", (now_iso,))
+        # single-row snapshot
+        conn.execute("INSERT INTO state_machine_state(id, updated_at) VALUES (1, ?)", (now_iso,))
+
+
+def test_check_d_ok_when_all_tables_present_and_fresh(tmp_path):
+    db = tmp_path / "trades.db"
+    _make_good_db(db)
+    r = A.check_d_sqlite(db_path=db, freshness_hours=6.0, market_hours_only=False)
+    assert r.code == "D"
+    assert r.status == "OK", f"unexpected: {r}"
+
+
+def test_check_d_fail_when_db_missing(tmp_path):
+    db = tmp_path / "absent.db"
+    r = A.check_d_sqlite(db_path=db, freshness_hours=6.0, market_hours_only=False)
+    assert r.status == "FAIL"
+    assert "not found" in r.observed.lower() or "missing" in r.observed.lower()
+
+
+def test_check_d_warn_when_table_missing(tmp_path):
+    db = tmp_path / "trades.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, timestamp TEXT)")
+    r = A.check_d_sqlite(db_path=db, freshness_hours=6.0, market_hours_only=False)
+    assert r.status in ("WARN", "FAIL")
+    assert "state_transitions" in r.observed or "missing" in r.observed.lower()
+
+
+def test_check_d_warn_when_event_table_stale(tmp_path):
+    from datetime import datetime, timedelta
+    db = tmp_path / "trades.db"
+    with sqlite3.connect(db) as conn:
+        for t in EXPECTED_TABLES:
+            conn.execute(f"CREATE TABLE {t} (id INTEGER PRIMARY KEY, timestamp TEXT, updated_at TEXT)")
+        stale = (datetime.now() - timedelta(days=2)).isoformat()
+        for t in ("state_transitions", "risk_events", "trades"):
+            conn.execute(f"INSERT INTO {t}(timestamp) VALUES (?)", (stale,))
+        conn.execute("INSERT INTO state_machine_state(id, updated_at) VALUES (1, ?)", (stale,))
+    r = A.check_d_sqlite(db_path=db, freshness_hours=6.0, market_hours_only=False)
+    assert r.status == "WARN"
+    assert "stale" in r.observed.lower() or "old" in r.observed.lower()
