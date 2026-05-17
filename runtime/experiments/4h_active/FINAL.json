@@ -25,6 +25,7 @@
       "total_pnl": 4570.343603656729,
       "commission": 104.8396513432745,
       "sessions": 34,
+      "total_trades": 294,
       "recenters": 32,
       "exits": 33,
       "round_trips": 38,
@@ -38,7 +39,7 @@
   },
   "walkforward_summary": {
     "windows": 6,
-    "mean_valid_sharpe": -0.008416624092646902,
-    "mean_valid_return_pct": 24.768821005359
+    "mean_valid_sharpe": -0.6153506860771331,
+    "mean_valid_return_pct": 17.297429730125845
   }
 }
