@@ -53,3 +53,4 @@ from telegram_bot.handlers import positions as _positions  # noqa: F401
 from telegram_bot.handlers import pnl as _pnl  # noqa: F401
 from telegram_bot.handlers import grid as _grid  # noqa: F401
 from telegram_bot.handlers import orders as _orders  # noqa: F401
+from telegram_bot.handlers import risk as _risk  # noqa: F401
