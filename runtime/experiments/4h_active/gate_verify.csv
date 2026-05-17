@@ -1,0 +1,7 @@
+metric,baseline,tuned,threshold,gate_passed
+annualized_pct,26.78,26.60,>= 13.39 (bl x0.5),PASS
+trades,279,294,>= 420 (bl x1.5),FAIL
+mdd_pct,15.17,15.22,<= 22.76 (bl x1.5),PASS
+walkforward_positive,7/8,2/6,>= 4,FAIL
+cross_symbol_diff_pp,N/A,N/A,N/A (chosen == baseline),N/A
+overall,N/A,N/A,all PASS,FAIL
