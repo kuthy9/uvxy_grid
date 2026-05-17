@@ -50,6 +50,15 @@ data/*.parquet
 # ───────── Alpaca 拉数脚本 (含 API key/secret, 不进 git) ─────────
 data/qqq.py
 
+# ───────── 数据更新 WIP (用户本地 working-set, 不进 git) ─────────
+# 这些是用户在 session 开始时已经在 working tree 里的 vxx-数据-更新 WIP 文件;
+# eda34dc 误 commit 过它们, 现已清理. 加这条规则避免未来 `git add .` 再次扫入.
+# 若需要正式跟踪某一个, 用 `git add -f data/vxx_*.py` 显式强制添加.
+data/vxx_1d.py
+data/vxx_1d.csv
+data/vxx_1h.py
+data/vxx_1h.csv
+
 # ───────── 项目内部文档 (本地用, 不发布到公共仓库) ─────────
 CLAUDE.md
 PROJECT_STATUS.md
