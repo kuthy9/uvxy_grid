@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 from dataclasses import asdict, dataclass
@@ -267,6 +268,37 @@ def check_b_compose(compose_path: Path) -> CheckResult:
     )
 
 
+def check_j_disk_log(log_path: Path, mount_path: Path,
+                     log_max_mb: float, disk_min_gb: float) -> CheckResult:
+    issues: list[str] = []
+    if not log_path.exists():
+        issues.append(f"log file absent: {log_path}")
+    else:
+        log_mb = log_path.stat().st_size / (1024 * 1024)
+        if log_mb > log_max_mb:
+            issues.append(f"log size {log_mb:.1f} MB > {log_max_mb} MB")
+    try:
+        usage = shutil.disk_usage(str(mount_path))
+        free_gb = usage.free / (1024 ** 3)
+        if free_gb < disk_min_gb:
+            issues.append(f"disk free {free_gb:.2f} GB < {disk_min_gb} GB")
+    except FileNotFoundError:
+        issues.append(f"mount path not found: {mount_path}")
+
+    if issues:
+        return CheckResult(
+            "J", "disk-log", "WARN",
+            observed="; ".join(issues),
+            expected=f"log ≤ {log_max_mb} MB, disk ≥ {disk_min_gb} GB free",
+            suggested_action="rotate logs / free space on Synology volume",
+        )
+    return CheckResult(
+        "J", "disk-log", "OK",
+        observed="log size and disk free within bounds",
+        expected="—", suggested_action="",
+    )
+
+
 # ─────────────────────────── CLI ───────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -299,6 +331,13 @@ def main(argv: list[str] | None = None) -> int:
     results.append(check_e_json_snapshots(grid_json=grid_json, base_shares=base_shares))
 
     results.append(check_b_compose(compose_path=Path(args.compose)))
+
+    log_path = Path(args.log)
+    results.append(check_j_disk_log(
+        log_path=log_path,
+        mount_path=log_path.parent if log_path.parent.exists() else Path("."),
+        log_max_mb=args.log_max_mb, disk_min_gb=args.disk_min_gb,
+    ))
 
     render_table(results)
     out = Path(args.out) if args.out else Path("runtime/audit") / (

@@ -198,3 +198,27 @@ def test_check_b_fail_on_bad_compose(tmp_path):
     r = A.check_b_compose(compose_path=p)
     assert r.status == "FAIL"
     assert "restart" in r.observed.lower() or "depends_on" in r.observed.lower()
+
+
+def test_check_j_ok_when_log_small_and_disk_has_space(tmp_path):
+    log = tmp_path / "grid_trader.log"
+    log.write_text("hello\n" * 10)
+    r = A.check_j_disk_log(log_path=log, mount_path=tmp_path,
+                          log_max_mb=10.0, disk_min_gb=0.001)
+    assert r.status == "OK"
+
+
+def test_check_j_warn_when_log_too_big(tmp_path):
+    log = tmp_path / "grid_trader.log"
+    log.write_bytes(b"x" * (2 * 1024 * 1024))  # 2 MiB
+    r = A.check_j_disk_log(log_path=log, mount_path=tmp_path,
+                          log_max_mb=1.0, disk_min_gb=0.001)
+    assert r.status == "WARN"
+    assert "log" in r.observed.lower()
+
+
+def test_check_j_warn_when_log_missing(tmp_path):
+    log = tmp_path / "missing.log"
+    r = A.check_j_disk_log(log_path=log, mount_path=tmp_path,
+                          log_max_mb=10.0, disk_min_gb=0.001)
+    assert r.status == "WARN"
