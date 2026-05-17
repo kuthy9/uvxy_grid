@@ -12,6 +12,7 @@ grid_bot.py — 网格交易核心逻辑
 
 import logging
 import os
+import time
 from datetime import datetime, date, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -23,7 +24,9 @@ from grid_engine import DynamicGridEngine
 from interfaces import Clock, Executor
 from pnl_tracker import PnLTracker
 from risk_manager import RiskManager
-from state_machine import StateMachine, SystemState, is_grid_state
+from state_machine import (
+    StateMachine, SystemState, is_grid_state, is_position_holding_state,
+)
 from trade_logger import TradeDatabase
 
 ET = ZoneInfo("America/New_York")
@@ -253,6 +256,53 @@ class GridBot:
         except Exception as e:
             logger.error(f"底仓股数落盘失败: {e}")
 
+    def _fetch_reconcile_with_retry(
+        self,
+        max_attempts: int = 3,
+        backoff_sec: tuple = (2.0, 5.0, 10.0),
+    ) -> dict:
+        """对 `executor.reconcile_on_startup()` 加 IBKR Gateway boot-window 防护.
+
+        问题: ib-gateway 的 healthcheck (4004 监听通过) 比 reqAllOpenOrders
+        完全返回开放订单列表要早. 如果 reconcile 跑在这个空窗里, broker 端会
+        假报"空仓 + 零开放单", 触发本函数下游的 drift #2 → 误清本地 FIFO →
+        实盘风险.
+
+        策略: 仅当 local state 处于持仓状态 (is_position_holding_state)
+        且 broker 报空仓 (real_shares < 1e-4) 时, 才视为可疑并重试.
+        其它情况立即接受首次结果, 不引入额外延迟.
+
+        Returns: 最后一次 reconcile 的 dict {position_shares, open_orders}.
+        """
+        state = self.state_machine.state
+        local_expects_positions = is_position_holding_state(state)
+
+        for attempt in range(1, max_attempts + 1):
+            reconcile = self.executor.reconcile_on_startup()
+            real_shares = float(reconcile.get("position_shares", 0.0))
+            broker_empty = real_shares < 0.0001
+
+            # 立即接受当: 不预期持仓 (无 race 可能) 或 broker 报有持仓.
+            if not local_expects_positions or not broker_empty:
+                return reconcile
+
+            # 走到这里: local 预期持仓 + broker 空仓 = 可疑 race.
+            if attempt < max_attempts:
+                wait = backoff_sec[min(attempt - 1, len(backoff_sec) - 1)]
+                logger.info(
+                    f"reconcile attempt {attempt}/{max_attempts}: broker 报空仓 "
+                    f"但 local state={state.value}; {wait}s 后重试 "
+                    f"(Gateway boot-window 防护)"
+                )
+                time.sleep(wait)
+            else:
+                logger.warning(
+                    f"reconcile: {max_attempts} 次尝试后 broker 仍报空仓 "
+                    f"(local state={state.value}); 接受 broker 空仓口径, "
+                    f"drift #2 将清 FIFO + 回 SCANNING"
+                )
+        return reconcile
+
     def _reconcile_with_broker(self):
         """
         启动时与 IBKR 真实状态对账:
@@ -262,7 +312,7 @@ class GridBot:
           - 出现严重漂移时 (持仓有但本地记为空仓) 直接进入 EXIT_PENDING 人工确认
         """
         logger.info("🔄 开始与 IBKR 对账...")
-        reconcile = self.executor.reconcile_on_startup()  # 返回 dict
+        reconcile = self._fetch_reconcile_with_retry()  # B2: boot-window race protection
         real_shares = float(reconcile.get("position_shares", 0.0))
         open_orders = reconcile.get("open_orders", [])
         logger.info(
