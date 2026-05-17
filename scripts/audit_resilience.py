@@ -28,7 +28,6 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable
 from zoneinfo import ZoneInfo
 
 
@@ -186,7 +185,6 @@ def check_d_sqlite(db_path: Path, freshness_hours: float,
 
 
 def check_e_json_snapshots(grid_json: Path, base_shares: Path) -> CheckResult:
-    issues: list[str] = []
     warns:  list[str] = []
     fails:  list[str] = []
 
@@ -425,7 +423,8 @@ def check_g_reconcile_retry(grid_bot_path: Path) -> CheckResult:
         return CheckResult("G", "reconcile-retry", "WARN",
                            observed=f"file not found: {grid_bot_path}",
                            expected="grid_bot.py present", suggested_action="")
-    m = re.search(r"def _reconcile_with_broker[\s\S]{0,2000}?(?=\n    def |\Z)", text)
+    # Bound 10k covers _reconcile_with_broker body (~3.3k chars) + headroom for future growth.
+    m = re.search(r"def _reconcile_with_broker[\s\S]{0,10000}?(?=\n    def |\Z)", text)
     body = m.group(0) if m else ""
     if not body:
         return CheckResult("G", "reconcile-retry", "WARN",

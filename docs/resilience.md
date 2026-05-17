@@ -56,16 +56,12 @@ main.py:
 | C | WARN | boot-loop | main.py exits on connect failure with no backoff token nearby | stepped sleep before sys.exit to avoid restart-loop log flood | DEFERRED per spec P1 (requires main.py edit); record in docs/resilience.md gap log |
 | D | FAIL | sqlite | db file not found: runtime/trades.db (cascading: this dev branch never ran the bot) | SQLite file present + readable + integrity_check ok | confirm DB_FILE env / volume mount on Synology |
 | E | WARN | json-snapshots | grid.json + base_shares.txt absent (expected before first ACTIVE_GRID) | files exist (or expected-absent if bot never reached ACTIVE_GRID) | verify against current state machine phase |
-| G | WARN | reconcile-retry | _reconcile_with_broker not found — false negative due to regex {0,2000} bound being smaller than actual body; conclusion still correct (function does lack retry logic) | retry on reqAllOpenOrders empty-result window | DEFERRED per spec P1 — record in docs/resilience.md gap log; note: regex bound should be tightened in future round |
+| G | WARN | reconcile-retry | _reconcile_with_broker has no retry/attempt token | retry on reqAllOpenOrders empty-result window | DEFERRED per spec P1 — record in docs/resilience.md gap log |
 | H | WARN | ibkr-reconnect | no disconnectedEvent subscription in ibkr_executor.py | subscribe disconnectedEvent + explicit reconnect path | DEFERRED per spec P1 |
 | I | WARN | data-scripts | data scripts not auto-managed: ['multi_pull.py', 'vxx.py', 'vxx_1d.py', 'vxx_1h.py'] | data scripts ideally idempotent + cron-managed | DEFERRED per spec P1 — record in gap log; cronify with catch-up |
 | K | WARN | heartbeat | db not found (cascading from D) | db file present | check DB_FILE / volume mount |
 
 **All WARN/FAIL items whose suggested action says "DEFERRED per spec P1" are deferred.** They require core trading file edits; the user must approve a separate round to implement them.
-
-### Note on check G (reconcile-retry) regex bound
-
-Check G uses a regex with bound `{0,2000}` to extract the `_reconcile_with_broker` function body. On this development branch, the function exceeds 2000 characters and the regex fails to match. The check reports "not found — false negative." However, the audit's conclusion is correct: the function does lack retry logic as required by the spec. This is a known false-negative; the regex bound should be tightened in a future round (deferred per P1).
 
 ## 4. Residual risks (audit cannot verify these)
 
@@ -73,6 +69,7 @@ Check G uses a regex with bound `{0,2000}` to extract the `_reconcile_with_broke
 - Mid-fill IBKR disconnect with partial order acknowledgment (covered by `_rollback_partial_base_entry` in core, but corner cases not exhaustively tested).
 - Synology DSM update mid-outage may delay Docker daemon start.
 - `data/*.py` ad-hoc download scripts skip an outage; bars from the gap are not auto-backfilled.
+- **Multi-symbol DB layout**: production uses per-symbol databases (`trades_uvxy.db`, `trades_vxx.db`) per `bot_factory.py` — the audit's default `--db ./runtime/trades.db` does not match real production paths. Checks D and K will report `db file not found` unless `--db ./runtime/trades_<symbol>.db` is passed explicitly. Run the audit once per symbol or use a shell loop. (See §5 example.)
 
 ## 5. How to re-run the audit
 
@@ -82,6 +79,11 @@ python scripts/audit_resilience.py --repo-root .
 
 # with manual host checklist acknowledged
 python scripts/audit_resilience.py --repo-root . --ack-host-checked
+
+# multi-symbol: run once per symbol (see Residual risks bullet on DB layout)
+for sym in uvxy vxx; do
+    python scripts/audit_resilience.py --db ./runtime/trades_${sym}.db --ack-host-checked
+done
 
 # custom freshness window (e.g. 24h during off-hours testing)
 python scripts/audit_resilience.py --freshness-hours 24
