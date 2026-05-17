@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections import OrderedDict
 from pathlib import Path
 from telegram_bot.readers.log_tail import LogTail
 
@@ -14,7 +15,10 @@ class LogPatternWatcher:
         self._compiled = [re.compile(p) for p in patterns]
         self._tail = LogTail(self.log_path)
         self._debounce = debounce_sec
-        self._last_seen_at: dict[str, float] = {}
+        # Bounded LRU-ish cache of recently-emitted lines (avoid unbounded growth
+        # over long runs). 2048 entries is plenty for sane debounce windows.
+        self._last_seen_at: "OrderedDict[str, float]" = OrderedDict()
+        self._max_seen_keys = 2048
 
     def start_baseline(self) -> None:
         self._tail.start_at_end()
@@ -31,5 +35,8 @@ class LogPatternWatcher:
             if now - last < self._debounce:
                 continue
             self._last_seen_at[key] = now
+            self._last_seen_at.move_to_end(key)
+            while len(self._last_seen_at) > self._max_seen_keys:
+                self._last_seen_at.popitem(last=False)
             out.append(f"🔔 log: {ln}")
         return out
