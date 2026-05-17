@@ -48,3 +48,4 @@ class Dispatcher:
 
 # Force registration of bundled handlers at import time.
 from telegram_bot.handlers import help as _help  # noqa: F401  (side effects)
+from telegram_bot.handlers import status as _status  # noqa: F401
