@@ -55,3 +55,4 @@ from telegram_bot.handlers import grid as _grid  # noqa: F401
 from telegram_bot.handlers import orders as _orders  # noqa: F401
 from telegram_bot.handlers import risk as _risk  # noqa: F401
 from telegram_bot.handlers import report as _report  # noqa: F401
+from telegram_bot.handlers import logs as _logs  # noqa: F401
