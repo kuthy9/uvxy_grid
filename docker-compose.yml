@@ -92,4 +92,4 @@ services:
       LOG_LEVEL: INFO
 
     volumes:
-      - /volume2/docker/uvxy_grid:/app
+      - /volume2/docker/uvxy_grid:/app:ro
