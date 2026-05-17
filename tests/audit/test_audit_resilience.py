@@ -318,3 +318,15 @@ def test_check_i_warn_when_data_scripts_present(tmp_path):
     r = A.check_i_data_scripts(data_dir=data_dir)
     assert r.status == "WARN"
     assert "vxx_1d.py" in r.observed
+
+
+def test_check_a_warn_without_ack():
+    r = A.check_a_host(host_ack=False)
+    assert r.code == "A"
+    assert r.status == "WARN"
+    assert "synology" in r.observed.lower() or "manual" in r.observed.lower()
+
+
+def test_check_a_ok_with_ack():
+    r = A.check_a_host(host_ack=True)
+    assert r.status == "OK"

@@ -483,6 +483,32 @@ def check_i_data_scripts(data_dir: Path) -> CheckResult:
     )
 
 
+HOST_CHECKLIST = [
+    "Synology Control Panel → Task Scheduler / Boot: Docker daemon set to auto-start on boot",
+    "Container Manager → Image: containers configured 'auto-restart' on boot (matches compose 'restart: always')",
+    "Control Panel → Regional Options: NTP enabled (clock skew breaks IBKR session)",
+    "DSM time zone matches docker-compose TZ (America/New_York)",
+    "UPS battery (if installed) integrated with DSM 'safe shutdown' setting; NOT in scope this round but worth confirming",
+]
+
+
+def check_a_host(host_ack: bool) -> CheckResult:
+    items = "\n  • ".join(HOST_CHECKLIST)
+    if host_ack:
+        return CheckResult(
+            "A", "host", "OK",
+            observed="operator acknowledged manual host checklist via --ack-host-checked",
+            expected=f"checklist:\n  • {items}",
+            suggested_action="",
+        )
+    return CheckResult(
+        "A", "host", "WARN",
+        observed=f"manual host checklist not acknowledged; run audit with --ack-host-checked after verifying:\n  • {items}",
+        expected="manual verification on Synology DSM",
+        suggested_action="verify each item on DSM, then re-run with --ack-host-checked",
+    )
+
+
 # ─────────────────────────── CLI ───────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -501,6 +527,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--disk-min-gb", type=float, default=1.0)
     parser.add_argument("--out", default=None,
                         help="JSON output path; default runtime/audit/<ts>.json")
+    parser.add_argument("--ack-host-checked", action="store_true",
+                        help="Acknowledge that the manual host checklist (A) has been verified on Synology DSM")
     args = parser.parse_args(argv)
 
     results: list[CheckResult] = []
@@ -535,6 +563,8 @@ def main(argv: list[str] | None = None) -> int:
     results.append(check_g_reconcile_retry(grid_bot_path=root / "grid_bot.py"))
     results.append(check_h_ibkr_reconnect(ibkr_executor_path=root / "ibkr_executor.py"))
     results.append(check_i_data_scripts(data_dir=root / "data"))
+
+    results.append(check_a_host(host_ack=args.ack_host_checked))
 
     render_table(results)
     out = Path(args.out) if args.out else Path("runtime/audit") / (
