@@ -226,6 +226,47 @@ def check_e_json_snapshots(grid_json: Path, base_shares: Path) -> CheckResult:
     )
 
 
+def check_b_compose(compose_path: Path) -> CheckResult:
+    if not compose_path.exists():
+        return CheckResult(
+            "B", "compose", "FAIL",
+            observed=f"compose file not found: {compose_path}",
+            expected="docker-compose.yml with both services",
+            suggested_action="run audit from repo root or pass --compose",
+        )
+    text = compose_path.read_text()
+
+    # Count restart:always occurrences — must be at least 2 (ib-gateway + uvxy-grid).
+    restart_always = len(re.findall(r"^\s*restart:\s*always\s*$", text, re.M))
+    has_depends_healthy = bool(re.search(
+        r"depends_on:\s*\n\s*ib-gateway:\s*\n\s*condition:\s*service_healthy",
+        text,
+    ))
+    healthcheck_retries_match = re.search(r"retries:\s*(\d+)", text)
+    retries = int(healthcheck_retries_match.group(1)) if healthcheck_retries_match else 0
+
+    issues = []
+    if restart_always < 2:
+        issues.append(f"restart:always count={restart_always} (need ≥2)")
+    if not has_depends_healthy:
+        issues.append("uvxy-grid missing depends_on.condition=service_healthy")
+    if retries < 20:
+        issues.append(f"healthcheck retries={retries} (recommended ≥20 for 2FA)")
+
+    if issues:
+        return CheckResult(
+            "B", "compose", "FAIL",
+            observed="; ".join(issues),
+            expected="restart:always on both services + service_healthy gate + retries≥20",
+            suggested_action="restore the gate from spec §4.1 / git history",
+        )
+    return CheckResult(
+        "B", "compose", "OK",
+        observed=f"restart_always={restart_always}, healthcheck retries={retries}",
+        expected="—", suggested_action="",
+    )
+
+
 # ─────────────────────────── CLI ───────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -256,6 +297,8 @@ def main(argv: list[str] | None = None) -> int:
     grid_json = Path(args.grid_json) if args.grid_json else Path(str(args.db) + ".grid.json")
     base_shares = Path(args.base_shares) if args.base_shares else Path(str(args.db) + ".base_shares.txt")
     results.append(check_e_json_snapshots(grid_json=grid_json, base_shares=base_shares))
+
+    results.append(check_b_compose(compose_path=Path(args.compose)))
 
     render_table(results)
     out = Path(args.out) if args.out else Path("runtime/audit") / (

@@ -154,3 +154,47 @@ def test_check_e_fail_when_grid_unparseable(tmp_path):
     r = A.check_e_json_snapshots(grid_json=grid, base_shares=base)
     assert r.status == "FAIL"
     assert "json" in r.observed.lower()
+
+
+GOOD_COMPOSE = """
+services:
+  ib-gateway:
+    restart: always
+    healthcheck:
+      retries: 20
+  uvxy-grid:
+    restart: always
+    depends_on:
+      ib-gateway:
+        condition: service_healthy
+"""
+
+BAD_COMPOSE = """
+services:
+  ib-gateway:
+    restart: on-failure
+  uvxy-grid:
+    depends_on:
+      ib-gateway:
+        condition: service_started
+"""
+
+
+def test_check_b_ok_on_good_compose(tmp_path):
+    p = tmp_path / "docker-compose.yml"
+    p.write_text(GOOD_COMPOSE)
+    r = A.check_b_compose(compose_path=p)
+    assert r.status == "OK"
+
+
+def test_check_b_fail_when_missing(tmp_path):
+    r = A.check_b_compose(compose_path=tmp_path / "absent.yml")
+    assert r.status == "FAIL"
+
+
+def test_check_b_fail_on_bad_compose(tmp_path):
+    p = tmp_path / "docker-compose.yml"
+    p.write_text(BAD_COMPOSE)
+    r = A.check_b_compose(compose_path=p)
+    assert r.status == "FAIL"
+    assert "restart" in r.observed.lower() or "depends_on" in r.observed.lower()
