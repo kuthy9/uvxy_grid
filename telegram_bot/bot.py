@@ -170,7 +170,16 @@ def _push_loop(runtime: Runtime, stop: threading.Event) -> None:
     for w in [*state_watchers, risk, log_w]:
         w.start_baseline()
 
+    # IBKR reconnect on disconnect (spec §5.7). The sidecar's IBKRReadOnly
+    # tolerates network blips by re-connecting itself; commands and watchers
+    # that hit IBKR will see is_connected=False until reconnect succeeds.
     while not stop.is_set():
+        try:
+            runtime.ibkr.reconnect_if_needed(
+                host=C.IBKR_HOST, port=C.IBKR_PORT, client_id=C.IBKR_CLIENT_ID
+            )
+        except Exception:
+            logger.error("reconnect_if_needed failed", exc_info=True)
         try:
             for w in state_watchers:
                 for m in w.poll():

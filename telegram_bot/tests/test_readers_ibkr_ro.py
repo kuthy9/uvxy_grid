@@ -46,3 +46,27 @@ def test_is_connected_reports_state():
     ib.isConnected.return_value = True
     client = ibkr_ro.IBKRReadOnly.from_ib(ib)
     assert client.is_connected() is True
+
+
+def test_reconnect_if_needed_skips_when_connected():
+    ib = MagicMock()
+    ib.isConnected.return_value = True
+    client = ibkr_ro.IBKRReadOnly.from_ib(ib)
+    assert client.reconnect_if_needed(host="x", port=1, client_id=2) is True
+    ib.connect.assert_not_called()
+
+
+def test_reconnect_if_needed_calls_connect_when_disconnected():
+    ib = MagicMock()
+    ib.isConnected.side_effect = [False, True]  # False before, True after
+    client = ibkr_ro.IBKRReadOnly.from_ib(ib)
+    assert client.reconnect_if_needed(host="x", port=1, client_id=2) is True
+    ib.connect.assert_called_once_with(host="x", port=1, clientId=2, readonly=True)
+
+
+def test_reconnect_if_needed_returns_false_on_exception():
+    ib = MagicMock()
+    ib.isConnected.return_value = False
+    ib.connect.side_effect = ConnectionRefusedError("nope")
+    client = ibkr_ro.IBKRReadOnly.from_ib(ib)
+    assert client.reconnect_if_needed(host="x", port=1, client_id=2) is False

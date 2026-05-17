@@ -51,6 +51,24 @@ class IBKRReadOnly:
         wanted = set(tags)
         return {it.tag: it.value for it in items if it.tag in wanted}
 
+    def reconnect_if_needed(self, host: str, port: int, client_id: int) -> bool:
+        """Reconnect if the underlying ib_insync connection has dropped.
+
+        Returns True if connected after the call, False otherwise. Safe to call
+        from a tight loop — does nothing if already connected.
+        """
+        if self._ib.isConnected():
+            return True
+        try:
+            self._ib.connect(host=host, port=port, clientId=client_id, readonly=True)
+        except Exception as e:  # noqa: BLE001 — sidecar must survive any IBKR error
+            logger.warning("ibkr_ro reconnect failed: %s: %s", type(e).__name__, e)
+            return False
+        if self._ib.isConnected():
+            logger.info("ibkr_ro reconnected (client_id=%s)", client_id)
+            return True
+        return False
+
 
 # ─── Import-time defense-in-depth ban ───
 for _name in dir(IBKRReadOnly):
