@@ -63,3 +63,33 @@ services:
 
     volumes:
       - /volume2/docker/uvxy_grid:/app
+
+  telegram-bot:
+    build:
+      context: /volume2/docker/uvxy_grid
+    container_name: telegram-bot
+    restart: always
+
+    depends_on:
+      ib-gateway:
+        condition: service_healthy
+
+    working_dir: /app
+    command: ["python", "-u", "-m", "telegram_bot.bot"]
+
+    environment:
+      TZ: America/New_York
+      IBKR_HOST: ib-gateway
+      IBKR_PORT: "4004"
+      IBKR_CLIENT_ID: "99"           # MUST differ from uvxy-grid's client_id=1
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      DB_FILE: ./runtime/trades.db
+      TG_DB_GLOB: ./runtime/trades_*.db
+      ACCOUNT_DB_FILE: ./runtime/account.db
+      LOG_FILE: ./runtime/grid_trader.log
+      REPORT_DIR: ./runtime/reports
+      LOG_LEVEL: INFO
+
+    volumes:
+      - /volume2/docker/uvxy_grid:/app
