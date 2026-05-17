@@ -50,3 +50,4 @@ class Dispatcher:
 from telegram_bot.handlers import help as _help  # noqa: F401  (side effects)
 from telegram_bot.handlers import status as _status  # noqa: F401
 from telegram_bot.handlers import positions as _positions  # noqa: F401
+from telegram_bot.handlers import pnl as _pnl  # noqa: F401
