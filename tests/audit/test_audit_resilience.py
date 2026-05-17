@@ -248,3 +248,73 @@ def test_check_k_warn_when_all_stale(tmp_path):
     r = A.check_k_heartbeat(db_path=db, freshness_hours=6.0, market_hours_only=False)
     assert r.status == "WARN"
     assert "stale" in r.observed.lower()
+
+
+def test_check_c_warn_when_no_backoff_in_main(tmp_path):
+    src = tmp_path / "main.py"
+    src.write_text(
+        "if not probe.connect():\n"
+        "    sys.exit(1)\n"
+    )
+    r = A.check_c_boot_loop(main_path=src)
+    assert r.status == "WARN"
+    assert "backoff" in r.suggested_action.lower() or "deferred" in r.suggested_action.lower()
+
+
+def test_check_c_ok_when_backoff_present(tmp_path):
+    src = tmp_path / "main.py"
+    src.write_text(
+        "if not probe.connect():\n"
+        "    time.sleep(retry_backoff_sec())\n"
+        "    sys.exit(1)\n"
+    )
+    r = A.check_c_boot_loop(main_path=src)
+    assert r.status == "OK"
+
+
+def test_check_f_ok_when_main_loop_has_broad_except(tmp_path):
+    src = tmp_path / "main.py"
+    src.write_text(
+        "while not stop:\n"
+        "    try:\n"
+        "        step()\n"
+        "    except Exception as e:\n"
+        "        log(e)\n"
+        "        time.sleep(30)\n"
+    )
+    r = A.check_f_main_loop_except(main_path=src)
+    assert r.status == "OK"
+
+
+def test_check_g_warn_when_reconcile_has_no_retry(tmp_path):
+    src = tmp_path / "grid_bot.py"
+    src.write_text(
+        "def _reconcile_with_broker(self):\n"
+        "    self.executor.reconcile_on_startup()\n"
+        "    # no retry\n"
+    )
+    r = A.check_g_reconcile_retry(grid_bot_path=src)
+    assert r.status == "WARN"
+
+
+def test_check_h_warn_when_no_disconnected_event(tmp_path):
+    src = tmp_path / "ibkr_executor.py"
+    src.write_text("class IBKRExecutor:\n    def connect(self): pass\n")
+    r = A.check_h_ibkr_reconnect(ibkr_executor_path=src)
+    assert r.status == "WARN"
+
+
+def test_check_h_ok_when_disconnected_event_subscribed(tmp_path):
+    src = tmp_path / "ibkr_executor.py"
+    src.write_text("self.ib.disconnectedEvent += self._on_disconnect\n")
+    r = A.check_h_ibkr_reconnect(ibkr_executor_path=src)
+    assert r.status == "OK"
+
+
+def test_check_i_warn_when_data_scripts_present(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "vxx_1d.py").write_text("# fetch\n")
+    r = A.check_i_data_scripts(data_dir=data_dir)
+    assert r.status == "WARN"
+    assert "vxx_1d.py" in r.observed

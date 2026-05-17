@@ -361,6 +361,128 @@ def check_k_heartbeat(db_path: Path, freshness_hours: float,
     )
 
 
+def _read_or_empty(path: Path) -> str:
+    try:
+        return path.read_text()
+    except FileNotFoundError:
+        return ""
+
+
+def check_c_boot_loop(main_path: Path) -> CheckResult:
+    text = _read_or_empty(main_path)
+    if not text:
+        return CheckResult("C", "boot-loop", "WARN",
+                           observed=f"file not found: {main_path}",
+                           expected="main.py present",
+                           suggested_action="run audit from repo root")
+    # Heuristic: sys.exit on connect failure must be preceded by a sleep/backoff token
+    # within the same logical block. We test a narrow window of 5 lines preceding sys.exit.
+    lines = text.splitlines()
+    has_exit_after_connect = False
+    has_backoff_near_exit = False
+    for i, line in enumerate(lines):
+        if "sys.exit(1)" in line or "sys.exit(3)" in line:
+            has_exit_after_connect = True
+            window = "\n".join(lines[max(0, i - 5):i])
+            if re.search(r"\bsleep|backoff", window):
+                has_backoff_near_exit = True
+                break
+    if has_exit_after_connect and not has_backoff_near_exit:
+        return CheckResult(
+            "C", "boot-loop", "WARN",
+            observed="main.py exits on connect failure with no backoff token nearby",
+            expected="stepped sleep before sys.exit to avoid restart-loop log flood",
+            suggested_action="DEFERRED per spec P1 (requires main.py edit); record in docs/resilience.md gap log",
+        )
+    return CheckResult("C", "boot-loop", "OK",
+                       observed="sys.exit paths appear backed off (or absent)",
+                       expected="—", suggested_action="")
+
+
+def check_f_main_loop_except(main_path: Path) -> CheckResult:
+    text = _read_or_empty(main_path)
+    if not text:
+        return CheckResult("F", "main-loop-except", "WARN",
+                           observed=f"file not found: {main_path}",
+                           expected="main.py present", suggested_action="")
+    has_while_loop = bool(re.search(r"while\s+not\s+.*stop", text))
+    has_broad_except = bool(re.search(r"except\s+Exception", text))
+    if has_while_loop and has_broad_except:
+        return CheckResult("F", "main-loop-except", "OK",
+                           observed="main loop has broad Exception handler",
+                           expected="—", suggested_action="")
+    return CheckResult(
+        "F", "main-loop-except", "WARN",
+        observed=f"while_loop={has_while_loop}, broad_except={has_broad_except}",
+        expected="while-loop with except Exception",
+        suggested_action="DEFERRED per spec P1",
+    )
+
+
+def check_g_reconcile_retry(grid_bot_path: Path) -> CheckResult:
+    text = _read_or_empty(grid_bot_path)
+    if not text:
+        return CheckResult("G", "reconcile-retry", "WARN",
+                           observed=f"file not found: {grid_bot_path}",
+                           expected="grid_bot.py present", suggested_action="")
+    m = re.search(r"def _reconcile_with_broker[\s\S]{0,2000}?(?=\n    def |\Z)", text)
+    body = m.group(0) if m else ""
+    if not body:
+        return CheckResult("G", "reconcile-retry", "WARN",
+                           observed="_reconcile_with_broker not found",
+                           expected="present", suggested_action="DEFERRED per spec P1")
+    # Strip comments to avoid false positives from "# no retry" comments
+    clean_body = "\n".join(line[:line.index('#')] if '#' in line else line for line in body.split('\n'))
+    has_retry = bool(re.search(r"for\s+\w+\s+in\s+range|retry|attempt", clean_body, re.I))
+    if has_retry:
+        return CheckResult("G", "reconcile-retry", "OK",
+                           observed="retry tokens present in reconcile body",
+                           expected="—", suggested_action="")
+    return CheckResult(
+        "G", "reconcile-retry", "WARN",
+        observed="_reconcile_with_broker has no retry/attempt token",
+        expected="retry on reqAllOpenOrders empty-result window",
+        suggested_action="DEFERRED per spec P1 — record in docs/resilience.md gap log",
+    )
+
+
+def check_h_ibkr_reconnect(ibkr_executor_path: Path) -> CheckResult:
+    text = _read_or_empty(ibkr_executor_path)
+    if not text:
+        return CheckResult("H", "ibkr-reconnect", "WARN",
+                           observed=f"file not found: {ibkr_executor_path}",
+                           expected="ibkr_executor.py present",
+                           suggested_action="")
+    if "disconnectedEvent" in text:
+        return CheckResult("H", "ibkr-reconnect", "OK",
+                           observed="disconnectedEvent referenced",
+                           expected="—", suggested_action="")
+    return CheckResult(
+        "H", "ibkr-reconnect", "WARN",
+        observed="no disconnectedEvent subscription in ibkr_executor.py",
+        expected="subscribe disconnectedEvent + explicit reconnect path",
+        suggested_action="DEFERRED per spec P1",
+    )
+
+
+def check_i_data_scripts(data_dir: Path) -> CheckResult:
+    if not data_dir.exists():
+        return CheckResult("I", "data-scripts", "OK",
+                           observed="no data/ dir",
+                           expected="—", suggested_action="")
+    scripts = sorted(p.name for p in data_dir.glob("*.py"))
+    if not scripts:
+        return CheckResult("I", "data-scripts", "OK",
+                           observed="no .py scripts in data/",
+                           expected="—", suggested_action="")
+    return CheckResult(
+        "I", "data-scripts", "WARN",
+        observed=f"data scripts not auto-managed by code: {scripts}",
+        expected="data scripts ideally idempotent + cron-managed",
+        suggested_action="DEFERRED per spec P1 — record in gap log; cronify with catch-up",
+    )
+
+
 # ─────────────────────────── CLI ───────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -406,6 +528,13 @@ def main(argv: list[str] | None = None) -> int:
         freshness_hours=args.freshness_hours,
         market_hours_only=True,
     ))
+
+    root = Path(args.repo_root)
+    results.append(check_c_boot_loop(main_path=root / "main.py"))
+    results.append(check_f_main_loop_except(main_path=root / "main.py"))
+    results.append(check_g_reconcile_retry(grid_bot_path=root / "grid_bot.py"))
+    results.append(check_h_ibkr_reconnect(ibkr_executor_path=root / "ibkr_executor.py"))
+    results.append(check_i_data_scripts(data_dir=root / "data"))
 
     render_table(results)
     out = Path(args.out) if args.out else Path("runtime/audit") / (
