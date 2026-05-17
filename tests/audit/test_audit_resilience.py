@@ -222,3 +222,29 @@ def test_check_j_warn_when_log_missing(tmp_path):
     r = A.check_j_disk_log(log_path=log, mount_path=tmp_path,
                           log_max_mb=10.0, disk_min_gb=0.001)
     assert r.status == "WARN"
+
+
+def test_check_k_ok_when_any_event_recent(tmp_path):
+    db = tmp_path / "trades.db"
+    from datetime import datetime, timedelta
+    with sqlite3.connect(db) as conn:
+        for t in ("state_transitions", "risk_events", "trades", "entry_evaluations"):
+            conn.execute(f"CREATE TABLE {t} (id INTEGER PRIMARY KEY, timestamp TEXT)")
+        # Only entry_evaluations has a recent row.
+        conn.execute("INSERT INTO entry_evaluations(timestamp) VALUES (?)",
+                     (datetime.now().isoformat(),))
+    r = A.check_k_heartbeat(db_path=db, freshness_hours=6.0, market_hours_only=False)
+    assert r.status == "OK"
+
+
+def test_check_k_warn_when_all_stale(tmp_path):
+    db = tmp_path / "trades.db"
+    from datetime import datetime, timedelta
+    stale = (datetime.now() - timedelta(days=3)).isoformat()
+    with sqlite3.connect(db) as conn:
+        for t in ("state_transitions", "risk_events", "trades", "entry_evaluations"):
+            conn.execute(f"CREATE TABLE {t} (id INTEGER PRIMARY KEY, timestamp TEXT)")
+            conn.execute(f"INSERT INTO {t}(timestamp) VALUES (?)", (stale,))
+    r = A.check_k_heartbeat(db_path=db, freshness_hours=6.0, market_hours_only=False)
+    assert r.status == "WARN"
+    assert "stale" in r.observed.lower()

@@ -299,6 +299,68 @@ def check_j_disk_log(log_path: Path, mount_path: Path,
     )
 
 
+HEARTBEAT_TABLES = ["state_transitions", "risk_events", "trades", "entry_evaluations"]
+
+
+def check_k_heartbeat(db_path: Path, freshness_hours: float,
+                      market_hours_only: bool = True) -> CheckResult:
+    if not Path(db_path).exists():
+        return CheckResult(
+            "K", "heartbeat", "WARN",
+            observed=f"db not found: {db_path}", expected="db file present",
+            suggested_action="check DB_FILE / volume mount",
+        )
+    now = datetime.now(ZoneInfo("America/New_York"))
+    in_market = _is_market_hours(now)
+    if market_hours_only and not in_market:
+        return CheckResult(
+            "K", "heartbeat", "OK",
+            observed=f"outside market hours ({now.isoformat()}) — skipped",
+            expected="—", suggested_action="",
+        )
+
+    newest_per_table: dict[str, datetime] = {}
+    uri = f"file:{db_path}?mode=ro&immutable=0"
+    with sqlite3.connect(uri, uri=True) as conn:
+        for t in HEARTBEAT_TABLES:
+            try:
+                row = conn.execute(f"SELECT MAX(timestamp) FROM {t}").fetchone()
+            except sqlite3.OperationalError:
+                continue
+            if row and row[0]:
+                try:
+                    ts = datetime.fromisoformat(row[0])
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=ZoneInfo("America/New_York"))
+                    newest_per_table[t] = ts
+                except ValueError:
+                    continue
+
+    if not newest_per_table:
+        return CheckResult(
+            "K", "heartbeat", "WARN",
+            observed="no event-bearing table has any rows",
+            expected="≥1 row across heartbeat tables",
+            suggested_action="confirm main bot has been running",
+        )
+
+    most_recent = max(newest_per_table.values())
+    delta = now - most_recent
+    if delta > timedelta(hours=freshness_hours):
+        return CheckResult(
+            "K", "heartbeat", "WARN",
+            observed=f"stale: most-recent event {most_recent.isoformat()} ({delta} ago, "
+                     f"market_hours={in_market})",
+            expected=f"within {freshness_hours}h during market hours",
+            suggested_action="check main bot process, IBKR connection, and log",
+        )
+    return CheckResult(
+        "K", "heartbeat", "OK",
+        observed=f"most-recent event {most_recent.isoformat()} ({delta} ago)",
+        expected="—", suggested_action="",
+    )
+
+
 # ─────────────────────────── CLI ───────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -337,6 +399,12 @@ def main(argv: list[str] | None = None) -> int:
         log_path=log_path,
         mount_path=log_path.parent if log_path.parent.exists() else Path("."),
         log_max_mb=args.log_max_mb, disk_min_gb=args.disk_min_gb,
+    ))
+
+    results.append(check_k_heartbeat(
+        db_path=Path(args.db),
+        freshness_hours=args.freshness_hours,
+        market_hours_only=True,
     ))
 
     render_table(results)
