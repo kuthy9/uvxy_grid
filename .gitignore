@@ -35,6 +35,7 @@ env/
 tws_settings/
 
 # ───────── 运行时产物 (实盘 DB / 日志 / 周报 / 状态快照 / 缓存) ─────────
+# (resilience audit writes JSON outputs under runtime/audit/; covered by this rule.)
 runtime/
 data_cache/
 logs/
