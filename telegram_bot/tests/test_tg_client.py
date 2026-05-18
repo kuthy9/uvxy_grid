@@ -10,7 +10,8 @@ def client():
     return TGClient(token="TEST_TOKEN", long_poll_timeout=30)
 
 
-def test_send_message_calls_correct_endpoint(client):
+def test_send_message_omits_parse_mode_when_none(client):
+    """parse_mode=None 必须从 body 里完全去掉 — 不能传 null, 否则 Telegram 400."""
     fake = MagicMock()
     fake.status_code = 200
     fake.json.return_value = {"ok": True, "result": {}}
@@ -19,7 +20,18 @@ def test_send_message_calls_correct_endpoint(client):
     args, kwargs = p.call_args
     assert "api.telegram.org/botTEST_TOKEN/sendMessage" in args[0]
     body = kwargs["json"]
-    assert body == {"chat_id": 42, "text": "hi", "parse_mode": None}
+    assert body == {"chat_id": 42, "text": "hi"}
+    assert "parse_mode" not in body
+
+
+def test_send_message_includes_parse_mode_when_set(client):
+    fake = MagicMock()
+    fake.status_code = 200
+    fake.json.return_value = {"ok": True, "result": {}}
+    with patch("telegram_bot.tg_client.requests.post", return_value=fake) as p:
+        client.send_message(chat_id=42, text="*hi*", parse_mode="Markdown")
+    body = p.call_args.kwargs["json"]
+    assert body == {"chat_id": 42, "text": "*hi*", "parse_mode": "Markdown"}
 
 
 def test_get_updates_returns_results(client):

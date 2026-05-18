@@ -59,7 +59,12 @@ class TGClient:
     # ─── Send message ───
     def send_message(self, chat_id: int, text: str, parse_mode: Optional[str] = None) -> bool:
         url = self._url("sendMessage")
-        body = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+        # 必须省略 parse_mode key (而不是传 None): Telegram API 把 null 视为
+        # "unsupported parse_mode" 直接 400 拒掉, 表现是 chat 完全收不到回复.
+        # 用 curl 验证: {"parse_mode": null} → 400; 整个 key 不传 → 200.
+        body: dict = {"chat_id": chat_id, "text": text}
+        if parse_mode is not None:
+            body["parse_mode"] = parse_mode
         return self._post_with_backoff(url, json_body=body)
 
     # ─── Send document ───
