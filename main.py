@@ -23,8 +23,11 @@ from trade_logger import setup_logging
 
 logger: logging.Logger = None
 
-DEFAULT_SYMBOLS = ["UVXY", "VXX"]
-DEFAULT_ALLOCATIONS = {"UVXY": 0.5, "VXX": 0.5}
+# 默认单 UVXY (2026-05-17 起). VXX 仍可显式启用:
+#   python main.py --symbols UVXY VXX
+# (无 --allocations 入参时, 系统对显式 symbols 均分; 详见下方 argparse 分支)
+DEFAULT_SYMBOLS = ["UVXY"]
+DEFAULT_ALLOCATIONS = {"UVXY": 1.0}
 
 
 def _exit_with_backoff(code: int) -> None:
@@ -65,7 +68,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS,
-                        help="实盘标的列表, 默认 UVXY VXX")
+                        help="实盘标的列表, 默认仅 UVXY; 可显式 `--symbols UVXY VXX`")
     parser.add_argument("--paper-verify", action="store_true",
                         help="Dry-run: 装配 + 一次 step + shutdown, 不实际下单")
     args = parser.parse_args()
