@@ -216,6 +216,8 @@ requests>=2.31.0      # 仅 data/qqq.py (Alpaca 拉数) 需要
 - [`PROJECT_STATUS.md`](./PROJECT_STATUS.md) — 项目动态进度 (随开发更新)
 - [`CLAUDE.md`](./CLAUDE.md) — 协作规则 / 架构约束 / 死规矩
 - [`docs/resilience.md`](./docs/resilience.md) — 断电恢复审计：启动→接管时序、Synology 手动 checklist、缺口清单（核心修复 deferred per P1）
+- [`docs/telegram_sidecar.md`](./docs/telegram_sidecar.md) — Telegram 只读 sidecar 部署/运维手册：token rotation、10 命令、5 push 通道、troubleshooting
 - [`docs/superpowers/specs/2026-05-17-resilience-and-telegram-sidecar-design.md`](./docs/superpowers/specs/2026-05-17-resilience-and-telegram-sidecar-design.md) — 审计 + sidecar 设计规范（P1/P2/P3 三条硬约束 + §4 审计 + §5 sidecar）
 - [`docs/superpowers/plans/2026-05-17-resilience-audit.md`](./docs/superpowers/plans/2026-05-17-resilience-audit.md) — 审计的 task-by-task 执行计划
+- [`docs/superpowers/plans/2026-05-17-telegram-sidecar.md`](./docs/superpowers/plans/2026-05-17-telegram-sidecar.md) — sidecar 的 task-by-task 执行计划
 - 代码注释 + `runtime/experiments/<interval>/*` — 历史决策的原始证据

@@ -42,6 +42,48 @@ as operational hygiene only.
   are research-only (verified: zero core trading file imports/reads from
   `data/`). Operational hygiene only, not a trading-correctness risk.
 
+## [2026-05-17] Telegram Read-Only Sidecar (read-only, P1-clean)
+
+### Added
+- `telegram_bot/` 新 Python 包（30+ 文件，~2000 行）：
+  - `bot.py` — long-poll + Dispatcher + 后台 push watcher 线程
+  - `config.py` — env-driven，缺关键 env 即 fail-fast（无静默 fallback）
+  - `auth.py` — 单 chat_id allowlist + 速率限制的未授权告警日志
+  - `tg_client.py` — 裸 requests 调 Telegram Bot API + 429 退避梯度 [5/30/120/300]s
+  - `smoke.py` — `python -m telegram_bot.bot --smoke` 离线一轮验证
+  - `readers/sqlite_ro.py` — 强制 `?mode=ro&immutable=0` 连接
+  - `readers/grid_json.py` — `{db}.grid.json` 解析 + 半写竞态 100ms retry-once
+  - `readers/base_shares.py` — `{db}.base_shares.txt` 解析
+  - `readers/log_tail.py` — inode+offset 跟踪、rotate-safe 日志 tail
+  - `readers/ibkr_ro.py` — ib_insync 只读包装 + **import-time write-API ban**（任何 placeOrder/cancelOrder 方法名会让模块拒绝加载）
+  - `handlers/*` — 10 个只读命令：/help /status /positions /pnl /grid /orders /risk /report /logs /health
+  - `push/*` — 4 个 push 通道：state_watcher / risk_watcher / log_watcher / heartbeat（覆盖 5 类事件：状态机转换、风控触发、错误/IBKR 断线/bot 启停、心跳停滞）
+- `telegram_bot/tests/` — 71 个单元测试（含 conftest 共享 fixtures、handlers、watchers、auth、tg_client、bot Runtime、smoke）
+- `docker-compose.yml` — 追加 `telegram-bot` 服务（独立 sidecar、与主 bot 同镜像不同 CMD、`IBKR_CLIENT_ID=99` 错开主 bot=1、`/app:ro` 挂载防御）
+- `.env.example` — 追加 Telegram + 调度 env 变量模板
+- `docs/telegram_sidecar.md` — 运维 runbook（**§2 token rotation 是部署前第一步**、§3 部署步骤、§4 命令表、§5 push 说明、§6 troubleshooting）
+- `docs/superpowers/specs/2026-05-17-resilience-and-telegram-sidecar-design.md` §5 — sidecar 设计规范
+- `docs/superpowers/plans/2026-05-17-telegram-sidecar.md` — task-by-task 执行计划
+
+### Hard constraints honored (binding for this round)
+- **P1 — 零核心代码改动**：未修改 17 个核心交易文件中的任何一个。sidecar 完全外部观察（read SQLite `?mode=ro` / read JSON 文件 / tail log / IBKR read-only API）。
+- **P2 — 零硬编码 / 零伪代码**：所有凭证走 env，缺失即 fail-fast；token 不进仓库、不写日志（`test_url_never_logged` 测试断言）；smoke 是"已运行"的证据来源。
+- **P3 — TDD + 回归**：每个模块（reader/handler/watcher）都走 TDD；71/71 sidecar 测试 + 31/31 pre-existing 项目测试，零回归。
+
+### Security
+- `ibkr_ro.py` import-time assertion 检查公开方法名是否匹配 `placeOrder|cancelOrder|modifyOrder|reqGlobalCancel`，命中则 `RuntimeError` 拒绝加载（纵深防御）
+- chat_id allowlist + 未授权请求静默丢弃 + 速率限制告警
+- `/logs` 输出对 IBKR 账户 ID 正则脱敏（`U\d{7}` 和 `DU\d{7}` → `***`）
+- docker-compose 挂载 `/app:ro` 让"不写共享卷"约束在容器层硬性强制
+
+### Verified
+- 102/102 项目级 pytest（71 sidecar + 31 pre-existing），零回归
+- smoke：`TELEGRAM_BOT_TOKEN=dummy TELEGRAM_CHAT_ID=0 python -m telegram_bot.bot --smoke` exit=0
+- import-time ban：`python -c "from telegram_bot.readers import ibkr_ro; print('ok')"` → `ok`
+
+### Deployment runbook
+部署前必须先去 BotFather rotate token（之前的 token 在 brainstorming 阶段被泄漏到对话历史）。完整步骤见 `docs/telegram_sidecar.md §2`。
+
 ## [2026-05-17] Resilience Audit (read-only, P1-clean)
 
 ### Added
