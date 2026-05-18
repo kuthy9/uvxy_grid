@@ -141,8 +141,11 @@ python scripts/compare_intervals.py
 # 实盘 Paper 验证 (smoke test)
 python main.py --paper-verify
 
-# 实盘多标的 (默认 UVXY+VXX 50/50, Paper)
+# 实盘 (默认单 UVXY, Paper)
 IBKR_HOST=127.0.0.1 IBKR_PORT=4002 python main.py
+
+# 实盘 (显式双标的 UVXY+VXX 50/50, Paper)
+IBKR_HOST=127.0.0.1 IBKR_PORT=4002 python main.py --symbols UVXY VXX
 
 # 实盘 (Docker, 需要本地 .env 提供 TWS_USERID/TWS_PASSWORD/TRADING_MODE 等)
 docker compose up -d
@@ -157,7 +160,7 @@ docker compose up -d
 > 数值会随研究推进变化, 权威来源是 [`findings.md`](./findings.md) +
 > `runtime/experiments/` 下的产物.
 
-- **当前默认基线**: `UVXY+VXX 50/50` × `4h` × `MultiSymbolOrchestrator`
+- **当前默认基线**: `UVXY` × `4h` × `MultiSymbolOrchestrator` (2026-05-17 起单标的, VXX 可显式 `--symbols UVXY VXX` 启用)
 - **回测样本**:
   - UVXY 5y 4h CSV (Alpaca IEX, 2021-01-04 → 2026-04-24)
   - VXX  ~5y 4h CSV (Alpaca IEX, 2021-05-17 → 2026-05-14)
@@ -216,6 +219,7 @@ requests>=2.31.0      # 仅 data/qqq.py (Alpaca 拉数) 需要
 - [`PROJECT_STATUS.md`](./PROJECT_STATUS.md) — 项目动态进度 (随开发更新)
 - [`CLAUDE.md`](./CLAUDE.md) — 协作规则 / 架构约束 / 死规矩
 - [`docs/resilience.md`](./docs/resilience.md) — 断电恢复审计：启动→接管时序、Synology 手动 checklist、缺口清单（核心修复 deferred per P1）
+- [`docs/uvxy_param_audit.md`](./docs/uvxy_param_audit.md) — UVXY 参数校准审计（2026-05-17 切换单 UVXY 默认时落账，结论：核心参数已 UVXY-tuned，资金分配比例本轮不需重新校准）
 - [`docs/telegram_sidecar.md`](./docs/telegram_sidecar.md) — Telegram 只读 sidecar 部署/运维手册：token rotation、10 命令、5 push 通道、troubleshooting
 - [`docs/superpowers/specs/2026-05-17-resilience-and-telegram-sidecar-design.md`](./docs/superpowers/specs/2026-05-17-resilience-and-telegram-sidecar-design.md) — 审计 + sidecar 设计规范（P1/P2/P3 三条硬约束 + §4 审计 + §5 sidecar）
 - [`docs/superpowers/plans/2026-05-17-resilience-audit.md`](./docs/superpowers/plans/2026-05-17-resilience-audit.md) — 审计的 task-by-task 执行计划

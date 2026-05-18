@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-05-17] DEFAULT_SYMBOLS → UVXY-only (VXX 保留为可选)
+
+### Changed
+- `main.py`: `DEFAULT_SYMBOLS` 从 `["UVXY", "VXX"]` 改为 `["UVXY"]`,
+  `DEFAULT_ALLOCATIONS` 从 `{"UVXY": 0.5, "VXX": 0.5}` 改为 `{"UVXY": 1.0}`.
+  `--symbols UVXY VXX` 仍可显式启用双标的 (走 argparse 现有均分分支).
+  - 动机: V49 全量 tune + 5y 回测最佳 = UVXY 4h (+103.78% / Sharpe 0.54 / MDD 8.88%).
+  - argparse `--symbols` help 文案同步更新.
+
+### Added
+- `docs/uvxy_param_audit.md` — UVXY 参数校准审计文档. 结论:
+  - 核心入场/网格/退出/止损参数已在 V47-V49 三轮专项调参中 UVXY-tuned;
+  - `config.py` 注释里的 `# QQQ-tuned: X` 是 *历史参考*, 不是当前值;
+  - `BASE_POSITION_RATIO=0.40` / `GRID_CAPITAL_RATIO=0.50` 是唯二从 V47 起
+    沿用 QQQ 默认且从未在 sweep 中变动的参数, 是"策略姿态"非"市场结构",
+    本次审计判定**不需要立即重新校准**, 未来若想优化怎么入手见 §4.
+
+### Verified
+- `tests/main_assembly` 1/1 pass
+- `tests/resilience_fixes` 25/25 pass
+- `tests/audit` 28/28 pass
+- 全 pytest 套件见 T4 验证段 (整合分支)
+
+## [2026-05-17] Integration Branch — feature/uvxy-only-integration
+
+合并 `feature/audit-deferred-fixes` (B1/B2/B3 resilience fixes) +
+`feature/telegram-sidecar` (telegram 只读 sidecar) 到统一分支.
+
+### Merge resolution
+- `.gitignore` / `CHANGELOG.md` / `README.md` 中两分支各自的 entry 冲突,
+  保留 HEAD 信息更全的版本 / 拼接两分支 entry (CHANGELOG 各自成段).
+
 ## [2026-05-17] Resilience Audit — Deferred Fixes B1/B2/B3 (core code, user-approved P1 lift)
 
 User explicitly lifted P1 for these three fixes after reviewing the audit's
