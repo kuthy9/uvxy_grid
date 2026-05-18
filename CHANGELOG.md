@@ -2,6 +2,65 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-05-17] Resilience Audit — Deferred Fixes B1/B2/B3 (core code, user-approved P1 lift)
+
+User explicitly lifted P1 for these three fixes after reviewing the audit's
+deferred items. Investigation confirmed data/*.py scripts are research-only
+(no live trading code reads data/) → B4 (data scripts) NOT fixed; documented
+as operational hygiene only.
+
+### Fixed
+- **B1 (`main.py`)** — restart-loop log flood. `_exit_with_backoff(code)`
+  helper sleeps `BOOT_RETRY_BACKOFF_SEC` (default 30s, env-overridable)
+  before `sys.exit` on the 4 connect-related exit paths. `sys.exit(2)` for
+  config errors left untouched (hard-exit so operator notices immediately).
+  - Commit: 29cc38b (5 tests, full pytest 36 passed).
+- **B2 (`grid_bot.py`)** — IBKR Gateway boot-window race in
+  `_reconcile_with_broker`. New `_fetch_reconcile_with_retry(max_attempts=3,
+  backoff_sec=(2,5,10))` retries when local state is in a position-holding
+  state (`is_position_holding_state`) AND broker reports empty. Other cases
+  accepted immediately. Prevents the worst-case: bot restart inside the
+  Gateway hydration window → drift #2 → wipe local FIFO → REAL MONEY risk.
+  - Commit: 33cc056 (8 tests, full pytest 44 passed).
+- **B3 (`ibkr_executor.py`)** — application-layer disconnect awareness.
+  `connect()` subscribes `disconnectedEvent` once (idempotent across
+  reconnects). `_on_disconnected` handler logs + clears
+  `_market_data_type_effective` so next reconnect re-evaluates live/delayed
+  cleanly. Does NOT trigger reconnect from the event handler (would block
+  ib_insync's asyncio loop). `disconnect()` marks `_intentional_disconnect=True`
+  BEFORE `self.ib.disconnect()` to win the race with the event. New
+  `ensure_connected()` helper as a reconnect-if-needed seam for callers.
+  - Commit: 68978a1 (12 tests, full pytest 56 passed).
+
+### Verified
+- 56/56 project pytest passes (31 pre-existing + 5 B1 + 8 B2 + 12 B3).
+- All three audit checks (C, G, H) now report OK on `audit_resilience.py`.
+- `docs/resilience.md §3` gap log updated to reflect fixed state.
+
+### Not fixed (intentional, per investigation 2026-05-17)
+- **B4 (data/*.py scripts not cron-managed)** — kept as WARN. Data scripts
+  are research-only (verified: zero core trading file imports/reads from
+  `data/`). Operational hygiene only, not a trading-correctness risk.
+
+## [2026-05-17] Resilience Audit (read-only, P1-clean)
+
+### Added
+- `scripts/audit_resilience.py` — 11-check 只读审计脚本（A 主机 / B compose / C-I 静态代码检查 / D-E SQLite+JSON 完整性 / J 磁盘 / K 心跳）。退出码 0/1/2 = OK/WARN/FAIL。可由 Synology Task Scheduler 每日运行。
+- `tests/audit/test_audit_resilience.py` — 28 个单元测试，每个检查走 TDD（失败用例 + 通过用例）。
+- `docs/resilience.md` — 启动→接管时序图、Synology Web UI 手动 checklist、首次审计输出的缺口清单（8 条 WARN/FAIL）、再跑指引、可选 cron 配置。
+- `docs/superpowers/specs/2026-05-17-resilience-and-telegram-sidecar-design.md` §4 — 审计设计规范。
+- `docs/superpowers/plans/2026-05-17-resilience-audit.md` — task-by-task 执行计划。
+- `.gitignore` — 添加 audit 输出目录说明。
+
+### Hard constraints honored (binding for this round)
+- **P1 — 零核心代码改动**：未修改 `main.py`、`grid_bot.py`、`orchestrator.py`、`ibkr_executor.py`、`risk_manager.py`、`grid_engine.py`、`config.py` 等 17 个核心文件中的任何一个。审计发现需要核心改动的缺口（C/G/H/I 的 4 项 WARN）全部 DEFERRED，记入 `docs/resilience.md` 等待单独批准的下一轮。
+- **P2 — 零硬编码 / 零伪代码**：所有路径来自 `os.environ.get` + 默认值或 argparse；缺关键值即 fail-fast 而非静默 fallback。
+- **P3 — TDD + 回归**：每个检查 (A–K) 都走"先写失败测试 → 实现 → 再跑同测试 → 跑邻近回归"的 4 步流程。
+
+### Verified
+- 31/31 项目级 pytest 通过（28 audit + 3 pre-existing），零回归。
+- `python scripts/audit_resilience.py --repo-root .` 跑通；本地 dev 分支 exit=2（D FAIL 因为没 trades.db，K WARN 级联；C/G/H/I WARN 是 DEFERRED 项；A WARN 需手动 --ack-host-checked）。
+
 ## [2026-05-15] Production Refactor
 
 ### Removed (Archived to archive/tactical/)

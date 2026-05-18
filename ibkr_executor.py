@@ -39,6 +39,9 @@ class IBKRExecutor(Executor):
         self._pnl_sub_id = None  # reqPnL 订阅 ID
         # 行情等级: None=未设置, 1=live, 3=delayed. 连接后初始化; live 超时会降级并缓存.
         self._market_data_type_effective: Optional[int] = None
+        # B3: ib_insync disconnectedEvent 订阅状态 + 意图标记
+        self._disconnect_subscribed: bool = False
+        self._intentional_disconnect: bool = False
 
     # ───── 连接 ─────
 
@@ -56,6 +59,12 @@ class IBKRExecutor(Executor):
                 self.ib.reqPnL(account)
             except Exception as e:
                 logger.warning(f"订阅 PnL 失败 (非致命): {e}")
+            # B3: 订阅 disconnectedEvent (仅一次, 跨 reconnect 不重复挂)
+            if not self._disconnect_subscribed:
+                self.ib.disconnectedEvent += self._on_disconnected
+                self._disconnect_subscribed = True
+            # 每次成功连接重置意图标记: 后续若意外掉线, handler 应识别为故障.
+            self._intentional_disconnect = False
             logger.info(f"✓ IBKR连接成功 @ {config.IBKR_HOST}:{config.IBKR_PORT}")
             return True
         except Exception as e:
@@ -63,10 +72,50 @@ class IBKRExecutor(Executor):
             return False
 
     def disconnect(self):
+        # B3: 标记"主动断连"必须 *在* ib.disconnect() 之前,
+        # 否则 ib_insync 可能在 disconnect() 返回前就触发 disconnectedEvent,
+        # 而 handler 读到的 _intentional_disconnect 仍为 False, 误判为故障.
+        self._intentional_disconnect = True
         try:
             self.ib.disconnect()
         except Exception:
             pass
+
+    def _on_disconnected(self) -> None:
+        """B3: ib_insync disconnectedEvent handler.
+
+        触发时机:
+          - 网络抖动 / Gateway 重启 / 远端主动断开 → 意外掉线 (_intentional=False)
+          - 我们调用 self.disconnect() 主动断开 → 意图断开 (_intentional=True)
+
+        意图断开: handler 静默退出 (避免和 disconnect()→reconnect() 路径打架).
+        意外掉线: 清掉 _market_data_type_effective 缓存让下一次 connect()
+                重新评估 live/delayed; 仅日志通报, 不在事件循环里做阻塞重连
+                (那会卡 ib_insync 的 asyncio 主循环).
+
+        重连由调用方驱动:
+          - get_current_price() 已有 _safe_reconnect() 重连路径
+          - 新增 ensure_connected() 暴露给 main.py / orchestrator 在每个 step
+            前可选调用
+        """
+        if self._intentional_disconnect:
+            return
+        logger.warning(
+            "⚠️ IBKR disconnectedEvent fired — 连接意外丢失. "
+            "下一次取价/下单时会自动尝试 _safe_reconnect."
+        )
+        self._market_data_type_effective = None
+
+    def ensure_connected(self) -> bool:
+        """Best-effort: 确保已连接. 若未连接, 触发一次 _safe_reconnect().
+        Returns: 调用后是否处于已连接状态.
+
+        本方法不做内部退避; 调用方负责节流 (避免 tight-loop hammer).
+        实盘主循环建议在 step 前调用一次, 失败时 sleep 由主循环处理.
+        """
+        if self.is_connected():
+            return True
+        return self._safe_reconnect()
 
     def is_connected(self) -> bool:
         return self.ib.isConnected()

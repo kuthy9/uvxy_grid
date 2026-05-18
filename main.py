@@ -27,6 +27,38 @@ DEFAULT_SYMBOLS = ["UVXY", "VXX"]
 DEFAULT_ALLOCATIONS = {"UVXY": 0.5, "VXX": 0.5}
 
 
+def _exit_with_backoff(code: int) -> None:
+    """Sleep BOOT_RETRY_BACKOFF_SEC seconds (default 30, env-overridable) then sys.exit(code).
+
+    Why this exists: Synology Docker runs uvxy-grid with `restart: always`. If
+    startup hits a transient failure (ib-gateway not yet ready, NetLiquidation
+    read fails, etc.) we sys.exit, Docker immediately restarts us, and we hit
+    the same failure again. Without a backoff this loops at ~1Hz and floods
+    the host log. The sleep slows the loop to ~once-per-30s, giving the
+    operator time to notice via /logs or telegram push alerts and giving
+    ib-gateway time to recover. sys.exit(2) (config-level errors) is NOT
+    routed through this — those should hard-exit so the operator sees them
+    immediately and fixes config rather than waiting for a slow loop.
+
+    Backoff is also configurable per environment: set BOOT_RETRY_BACKOFF_SEC=5
+    in `.env` to make dev / paper iterate faster. Negative or invalid values
+    are treated as zero-sleep (defensive).
+    """
+    try:
+        sleep_sec = float(os.environ.get("BOOT_RETRY_BACKOFF_SEC", "30"))
+    except (TypeError, ValueError):
+        sleep_sec = 30.0
+    sleep_sec = max(0.0, sleep_sec)
+    if logger is not None:
+        logger.warning(
+            f"startup exit code={code}: sleeping {sleep_sec:.0f}s before exit "
+            f"to slow docker restart-loop (override via BOOT_RETRY_BACKOFF_SEC env)"
+        )
+    if sleep_sec > 0:
+        time.sleep(sleep_sec)
+    sys.exit(code)
+
+
 def main():
     global logger
     logger = setup_logging()
@@ -63,19 +95,19 @@ def main():
     probe_executor = IBKRExecutor()
     if not probe_executor.connect():
         logger.error("启动失败: IBKR 连接失败 (probe)")
-        sys.exit(1)
+        _exit_with_backoff(1)
     try:
         summary = probe_executor.get_account_summary()
         live_equity = float(summary.get("NetLiquidation", 0) or 0)
     except Exception as e:
         logger.error(f"读取账户净值异常: {e}")
-        sys.exit(3)
+        _exit_with_backoff(3)
     finally:
         probe_executor.disconnect()
 
     if live_equity <= 0:
         logger.error(f"IBKR NetLiquidation 无效 ({live_equity}), 拒绝启动.")
-        sys.exit(3)
+        _exit_with_backoff(3)
 
     reserve = float(os.getenv("CAPITAL_RESERVE_RATIO", "0.05"))
     config.TOTAL_CAPITAL = round(live_equity * (1.0 - reserve), 2)
@@ -103,7 +135,7 @@ def main():
         except Exception as e:
             logger.error(f"paper-verify FAIL: {e}", exc_info=True)
             print(f"paper-verify FAIL: {e}")
-            sys.exit(1)
+            _exit_with_backoff(1)
         return
 
     # 正常实盘主循环
@@ -118,7 +150,7 @@ def main():
         orch.start_all()
     except Exception as e:
         logger.error(f"启动失败: {e}", exc_info=True)
-        sys.exit(1)
+        _exit_with_backoff(1)
 
     logger.info("主循环启动 (Ctrl+C 退出, GTC订单保留)")
 
