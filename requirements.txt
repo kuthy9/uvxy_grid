@@ -12,3 +12,11 @@ numpy>=1.24.0          # 指标计算
 
 # 仅 data/qqq.py (Alpaca 数据抓取脚本) 需要; 回测读 CSV 不依赖此包:
 requests>=2.31.0
+
+# Python zoneinfo fallback — Debian slim 镜像的 apt tzdata 包不含 US/*
+# legacy aliases (e.g. "US/Eastern"), 但 IBKR 在 execDetails 返回的
+# timestamp 字符串就是 "20260518 10:31:50 US/Eastern". 不装这个包会让
+# ib_insync.util.parseIBDatetime 每次解析历史 fill 都抛 ZoneInfoNotFoundError
+# (不影响交易, 但污染 stderr). zoneinfo 在系统 tzdata 找不到时自动 fallback
+# 到此 PyPI 包.
+tzdata>=2024.1
