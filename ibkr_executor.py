@@ -6,6 +6,7 @@ ibkr_executor.py — 实盘执行层 (IBKR)
 """
 
 import logging
+import math
 import time
 from datetime import date, datetime
 from typing import Optional
@@ -577,6 +578,12 @@ class IBKRExecutor(Executor):
         B5: accountValues 里的 RealizedPnL 是"当日"字段, 不是累计,
         不能作 fallback, 否则周报里"累计"会错显为"今日".
         取不到时返回 None, 上层应降级到本地胜率统计.
+
+        Bug 1 修复: IBKR reqPnL 在账户从未平仓时返回 pnl.realizedPnL = NaN
+        (不是 None), 旧逻辑只判 `is not None`, NaN 漏过去, 下游 f-string
+        渲染为 "+nan" 污染周报 log + HTML. 这里把 NaN/Inf 也视为缺失值,
+        return None 让调用方走 fallback (本地胜率统计 / 周报 fallback to
+        local SUM(trades.pnl)).
         """
         if not self.is_connected():
             return None
@@ -588,8 +595,12 @@ class IBKRExecutor(Executor):
                 self.ib.sleep(1.0)
                 pnls = self.ib.pnl()
             for pnl in pnls:
-                if pnl.realizedPnL is not None:
-                    return float(pnl.realizedPnL)
+                if pnl.realizedPnL is None:
+                    continue
+                val = float(pnl.realizedPnL)
+                if math.isnan(val) or math.isinf(val):
+                    continue
+                return val
         except Exception:
             pass
 
