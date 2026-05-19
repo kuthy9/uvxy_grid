@@ -41,6 +41,10 @@ def make_db(tmp_path):
                 timestamp TEXT NOT NULL, from_state TEXT, to_state TEXT, reason TEXT
             )
         """,
+        # 注: per-symbol DB (trades_*.db) 用的是 risk_events / risk_state;
+        # 账户级 DB (account.db) 用的是 account_risk_events / account_risk_state.
+        # 两套 schema 列结构不同, 不可混读 — 这里都建出来让单一 make_db()
+        # 灵活模拟两种 DB 用途.
         "risk_events": """
             CREATE TABLE risk_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +56,29 @@ def make_db(tmp_path):
             CREATE TABLE risk_state (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL, prev_close REAL, note TEXT
+            )
+        """,
+        "account_risk_events": """
+            CREATE TABLE account_risk_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL, event_type TEXT NOT NULL,
+                details TEXT, action_taken TEXT
+            )
+        """,
+        "account_risk_state": """
+            CREATE TABLE account_risk_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                hard_stop_triggered INTEGER DEFAULT 0,
+                daily_loss_triggered INTEGER DEFAULT 0,
+                last_reset_date TEXT,
+                updated_at TEXT
+            )
+        """,
+        "account_trade_pnl": """
+            CREATE TABLE account_trade_pnl (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL, date TEXT NOT NULL,
+                symbol TEXT NOT NULL, net_pnl REAL NOT NULL, note TEXT
             )
         """,
         "trades": """

@@ -4,12 +4,24 @@ report_generator.py — 日终报告生成器
 生成HTML格式的日报，保存在 ./reports/ 目录下
 """
 
+import math
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from html import escape
 
 import config
+
+
+def _is_finite_number(value) -> bool:
+    """True 当 value 是已定义的有限浮点 (排除 None / NaN / Inf)."""
+    if value is None:
+        return False
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(v)
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -173,10 +185,20 @@ class ReportGenerator:
             "ACTIVE_GRID": "active", "EXIT_PENDING": "exit",
         }
 
-        # 账户级 realized PnL (IBKR 权威), 缺失时回退到 trades 累计
+        # 账户级 realized PnL (IBKR 权威), 缺失时回退到 trades 累计.
+        # NaN/Inf 也视为缺失 — IBKR reqPnL 在账户无已平仓对时
+        # pnl.realizedPnL 返回 NaN (不是 None), 这里统一兜底.
         realized_pnl = account_data.get("realized_pnl")
-        if realized_pnl is None:
+        if not _is_finite_number(realized_pnl):
             realized_pnl = total_pnl_local
+        else:
+            realized_pnl = float(realized_pnl)
+
+        unrealized_pnl = account_data.get("unrealized_pnl", 0)
+        if not _is_finite_number(unrealized_pnl):
+            unrealized_pnl = 0.0
+        else:
+            unrealized_pnl = float(unrealized_pnl)
 
         # 胜率区块
         win_stats = account_data.get("win_rate")
@@ -207,8 +229,8 @@ class ReportGenerator:
             today_pnl_class=cls(week_pnl),
             total_pnl=realized_pnl,
             total_pnl_class=cls(realized_pnl),
-            unrealized=account_data.get("unrealized_pnl", 0),
-            unrealized_class=cls(account_data.get("unrealized_pnl", 0)),
+            unrealized=unrealized_pnl,
+            unrealized_class=cls(unrealized_pnl),
             shares=account_data.get("shares", 0),
             cash=account_data.get("cash", 0),
             trades_section=trades_section,

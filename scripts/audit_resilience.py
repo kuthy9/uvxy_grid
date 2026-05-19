@@ -9,7 +9,11 @@ NEVER touches Telegram. It only reads + greps + reports.
 
 Run:
     python scripts/audit_resilience.py
-    python scripts/audit_resilience.py --db ./runtime/trades.db --log ./runtime/grid_trader.log
+    python scripts/audit_resilience.py --db ./runtime/trades_uvxy.db --log ./runtime/grid_trader.log
+
+Default --db: $DB_FILE if set, otherwise the newest ./runtime/trades_*.db
+(per-symbol bot file written by bot_factory). Legacy ./runtime/trades.db is
+only used as a last-resort fallback if no per-symbol DB exists.
 
 Exit codes:
     0 — all checks OK
@@ -19,6 +23,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -29,6 +34,39 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+
+# Per-symbol DBs are written by bot_factory.py at path pattern
+# `./runtime/trades_{sym}.db` (see bot_factory.py:200,264). The legacy
+# single-symbol path `./runtime/trades.db` is no longer written by any
+# live bot but may still exist on disk with orphan rows.
+LEGACY_SINGLE_DB = "./runtime/trades.db"
+PER_SYMBOL_DB_GLOB = "./runtime/trades_*.db"
+
+
+def discover_default_db(
+    glob_pattern: str = PER_SYMBOL_DB_GLOB,
+    legacy_fallback: str = LEGACY_SINGLE_DB,
+) -> str:
+    """Pick the DB path the audit script should default to.
+
+    Order:
+      1. Environment override (handled by caller via os.environ).
+      2. Newest per-symbol DB matched by `trades_*.db` glob (mtime).
+      3. Legacy `trades.db` as last resort.
+
+    Returns a path string (not necessarily an existing file — the legacy
+    fallback may also be absent, in which case the underlying check
+    reports FAIL, which is the historical behavior we want to preserve).
+    """
+    matches = sorted(
+        glob.glob(glob_pattern),
+        key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
+        reverse=True,
+    )
+    if matches:
+        return matches[0]
+    return legacy_fallback
 
 
 # ─────────────────────────── Data model ───────────────────────────
@@ -512,7 +550,15 @@ def check_a_host(host_ack: bool) -> CheckResult:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Resilience audit for equity_grid.")
-    parser.add_argument("--db", default=os.environ.get("DB_FILE", "./runtime/trades.db"))
+    parser.add_argument(
+        "--db",
+        default=os.environ.get("DB_FILE") or discover_default_db(),
+        help=(
+            "SQLite DB path. Default: $DB_FILE if set, otherwise the newest "
+            "./runtime/trades_*.db (per-symbol bot), with ./runtime/trades.db "
+            "as last-resort fallback if no per-symbol file exists."
+        ),
+    )
     parser.add_argument("--log", default=os.environ.get("LOG_FILE", "./runtime/grid_trader.log"))
     parser.add_argument("--grid-json", default=None,
                         help="Defaults to <db>.grid.json")

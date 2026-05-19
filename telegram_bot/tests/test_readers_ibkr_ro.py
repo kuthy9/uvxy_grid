@@ -14,11 +14,53 @@ def test_write_api_ban_at_import():
         )
 
 
-def test_portfolio_calls_ib_portfolio():
+def test_portfolio_default_does_not_refresh():
+    """默认 refresh=False — 行为完全等同旧实现, 不应触发 reqAccountUpdates."""
     ib = MagicMock()
     ib.portfolio.return_value = [MagicMock()]
     client = ibkr_ro.IBKRReadOnly.from_ib(ib)
     assert client.portfolio() == ib.portfolio.return_value
+    ib.portfolio.assert_called_once_with()
+    ib.reqAccountUpdates.assert_not_called()
+    ib.sleep.assert_not_called()
+
+
+def test_portfolio_refresh_true_triggers_reqAccountUpdates_and_sleep():
+    """refresh=True 时应调 reqAccountUpdates(True) 并 sleep, 再返回 portfolio."""
+    ib = MagicMock()
+    ib.isConnected.return_value = True
+    ib.portfolio.return_value = ["fresh-item"]
+    client = ibkr_ro.IBKRReadOnly.from_ib(ib)
+    result = client.portfolio(refresh=True, settle_sec=0.05)
+    assert result == ["fresh-item"]
+    ib.reqAccountUpdates.assert_called_once_with(True)
+    ib.sleep.assert_called_once_with(0.05)
+    ib.portfolio.assert_called_once_with()
+
+
+def test_portfolio_refresh_does_not_call_when_disconnected():
+    """断连时跳过 refresh — 不应试图 reqAccountUpdates (会抛 not-connected)."""
+    ib = MagicMock()
+    ib.isConnected.return_value = False
+    ib.portfolio.return_value = []
+    client = ibkr_ro.IBKRReadOnly.from_ib(ib)
+    client.portfolio(refresh=True)
+    ib.reqAccountUpdates.assert_not_called()
+    ib.sleep.assert_not_called()
+    # 仍然应当 fall through 到 portfolio() — 返回缓存值 (可能空, 但不抛)
+    ib.portfolio.assert_called_once_with()
+
+
+def test_portfolio_refresh_failure_falls_back_to_cache():
+    """reqAccountUpdates 抛异常时, sidecar 必须返回缓存值不抛."""
+    ib = MagicMock()
+    ib.isConnected.return_value = True
+    ib.reqAccountUpdates.side_effect = ConnectionError("transient")
+    ib.portfolio.return_value = ["cached-item"]
+    client = ibkr_ro.IBKRReadOnly.from_ib(ib)
+    result = client.portfolio(refresh=True)
+    # 不抛, 返回缓存
+    assert result == ["cached-item"]
     ib.portfolio.assert_called_once_with()
 
 

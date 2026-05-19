@@ -188,11 +188,43 @@ class GridBot:
         logger.info(f"🚀 进入主循环 | 状态={self.state_machine.state.value}")
 
     def _try_restore_grid(self):
-        """当状态机处于 grid states (OFFENSIVE/DEFENSIVE/ACTIVE) / EXIT_PENDING 时, 尝试从快照恢复网格引擎."""
+        """根据状态机当前状态恢复 DynamicGridEngine.
+
+        两条独立分支:
+          * EXIT_PENDING — grid 快照可选: _handle_exit_pending 只用持仓+FIFO,
+            缺 .grid.json 不是错误, 保持 EXIT_PENDING 继续清仓.
+            (旧实现把它和 grid states 合并, 缺快照就回退 SCANNING,
+             再靠 reconcile drift #1 绕回 EXIT_PENDING — 状态写两次, 日志噪声.)
+          * grid states (OFFENSIVE/DEFENSIVE/ACTIVE) — grid 快照必需:
+            缺/损坏均回退 SCANNING, 由后续 reconcile 决定如何修正持仓.
+          * 其它状态 — 不动.
+        """
         state = self.state_machine.state
-        if not (is_grid_state(state) or state == SystemState.EXIT_PENDING):
-            return
         path = _grid_state_path(self.db.db_path)
+
+        if state == SystemState.EXIT_PENDING:
+            if not os.path.exists(path):
+                logger.info(
+                    f"EXIT_PENDING 启动: 无网格快照 {path}, 仅按 FIFO+持仓清仓"
+                )
+                return
+            try:
+                self.grid = DynamicGridEngine.load_state(path)
+                logger.info(
+                    f"📂 网格引擎恢复 (EXIT_PENDING) | "
+                    f"中轴${self.grid.center_price:.2f}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"EXIT_PENDING 启动: 网格快照损坏 {path}: {e}, "
+                    f"仅按 FIFO+持仓清仓"
+                )
+                self.grid = None
+            return
+
+        if not is_grid_state(state):
+            return
+
         if not os.path.exists(path):
             logger.warning(
                 f"状态={state.value} 但未找到网格快照 {path}, 回退到 SCANNING"
@@ -1045,26 +1077,36 @@ class GridBot:
 
         logger.info(f"EXIT分解: 持仓{actual:.4f}股 = 网格{grid_to_sell:.4f} + 底仓{base_to_sell:.4f}")
 
+        filled_grid = 0.0
+        filled_base = 0.0
         if grid_to_sell > 0.0001:
-            self._liquidate_grid_shares(grid_to_sell)
+            filled_grid = self._liquidate_grid_shares(grid_to_sell)
         if base_to_sell > 0.0001:
-            self._liquidate_base_shares(base_to_sell)
+            filled_base = self._liquidate_base_shares(base_to_sell)
 
-        remaining = self.executor.get_position_details()
-        if remaining["shares"] < 0.0001:
+        # 用本地算术推断剩余, 不重读 ib.portfolio() — 其 positionEvent 在 fill 后
+        # 通常滞后 100–500 ms, 立即重读会得到 stale 缓存. fill["quantity"] 来自
+        # Trade.orderStatus 是权威值. 下一轮 sleep(2) 后 IBKR positionEvent 已经
+        # 到位, 启动时的 _reconcile_with_broker drift #2 也会兜底.
+        estimated_remaining = max(0.0, actual - filled_grid - filled_base)
+        if estimated_remaining < 0.0001:
             self._finalize_exit()
             return
 
-        logger.warning(f"EXIT后仍有 {remaining['shares']:.4f} 股, 下轮重试")
+        logger.warning(
+            f"EXIT 本轮已卖 grid={filled_grid:.4f} base={filled_base:.4f}, "
+            f"估计剩余 {estimated_remaining:.4f} 股, 下轮 IBKR 对账确认"
+        )
         self.db.log_risk_event("EXIT_INCOMPLETE",
-                                f"剩余{remaining['shares']:.4f}股",
+                                f"剩余约 {estimated_remaining:.4f} 股",
                                 "保持 EXIT_PENDING")
 
-    def _liquidate_grid_shares(self, grid_shares: float):
+    def _liquidate_grid_shares(self, grid_shares: float) -> float:
+        """卖 grid_shares 股网格仓. 返回实际成交股数 (0.0 表示未成交)."""
         qty = config.round_quantity(grid_shares)
         if qty <= 0:
             logger.info(f"网格清仓数量 {grid_shares:.4f} 取整后为 0, 跳过")
-            return
+            return 0.0
         oid = self.executor.place_market_order(
             action="SELL", quantity=qty,
             order_type_label="EXIT_GRID"
@@ -1072,14 +1114,14 @@ class GridBot:
         if not oid:
             self.db.log_risk_event("EXIT_ORDER_FAIL",
                                     f"网格{grid_shares:.4f}失败", "需人工")
-            return
+            return 0.0
 
         fill = self.executor.wait_for_order_fill(oid, timeout_sec=60)
         if not fill:
             self.db.log_risk_event("EXIT_TIMEOUT",
                                     f"网格{grid_shares:.4f}超时",
                                     "需核查队列与持仓")
-            return
+            return 0.0
 
         result = self.pnl.record_sell(
             quantity=fill["quantity"], price=fill["fill_price"],
@@ -1098,12 +1140,14 @@ class GridBot:
                 f"计划{grid_shares:.4f} 实际{fill['quantity']:.4f}",
                 "继续处理剩余"
             )
+        return float(fill["quantity"])
 
-    def _liquidate_base_shares(self, requested_qty: float):
+    def _liquidate_base_shares(self, requested_qty: float) -> float:
+        """卖 requested_qty 股底仓. 返回实际成交股数 (0.0 表示未成交)."""
         qty = config.round_quantity(requested_qty)
         if qty <= 0:
             logger.info(f"底仓清仓数量 {requested_qty:.4f} 取整后为 0, 跳过")
-            return
+            return 0.0
         oid = self.executor.place_market_order(
             action="SELL", quantity=qty,
             order_type_label="EXIT_BASE"
@@ -1111,13 +1155,13 @@ class GridBot:
         if not oid:
             self.db.log_risk_event("EXIT_ORDER_FAIL",
                                     f"底仓{requested_qty:.4f}失败", "需人工")
-            return
+            return 0.0
 
         fill = self.executor.wait_for_order_fill(oid, timeout_sec=60)
         if not fill:
             self.db.log_risk_event("EXIT_TIMEOUT",
                                     f"底仓{requested_qty:.4f}超时", "需人工")
-            return
+            return 0.0
 
         self.db.log_trade(
             "SELL", config.SYMBOL, fill["quantity"], fill["fill_price"],
@@ -1131,6 +1175,7 @@ class GridBot:
                 f"底仓计划{requested_qty:.4f} 实际{fill['quantity']:.4f}",
                 "继续处理剩余"
             )
+        return float(fill["quantity"])
 
     def _finalize_exit(self):
         self._base_position_shares = 0

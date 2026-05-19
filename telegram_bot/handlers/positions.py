@@ -5,10 +5,13 @@ from __future__ import annotations
 from telegram_bot.handlers import register
 
 
-@register("/positions", "current positions from IBKR (read-only)")
+@register("/positions", "current positions from IBKR (read-only, forces fresh sync)")
 def handle(args: list, ctx: dict) -> str:
     ibkr = ctx["ibkr"]
-    items = ibkr.portfolio()
+    # refresh=True: 主动重新订阅 reqAccountUpdates, 避免长连接下 ib_insync
+    # 的 portfolio 缓存停留在数小时前快照 — 实战见过 22+ 小时无 update 事件,
+    # 用户看到陈旧持仓 (见 IBKRReadOnly.portfolio docstring).
+    items = ibkr.portfolio(refresh=True)
     if not items:
         return "no positions"
     lines = [f"{'SYMBOL':<6} {'SHARES':>10} {'AVG':>8} {'MKT':>8} {'VALUE':>10} {'UNR':>8}"]

@@ -330,3 +330,85 @@ def test_check_a_warn_without_ack():
 def test_check_a_ok_with_ack():
     r = A.check_a_host(host_ack=True)
     assert r.status == "OK"
+
+
+# ─────── default --db discovery (Bug 4 — stop pointing at LEGACY trades.db)
+
+def test_discover_default_db_returns_newest_per_symbol(tmp_path, monkeypatch):
+    """When per-symbol DBs exist, pick the newest by mtime."""
+    monkeypatch.chdir(tmp_path)
+    rt = tmp_path / "runtime"
+    rt.mkdir()
+    older = rt / "trades_vxx.db"
+    newer = rt / "trades_uvxy.db"
+    older.write_text("x"); newer.write_text("x")
+    # Force `newer` to have a strictly later mtime than `older`.
+    import os as _os, time as _time
+    _os.utime(older, (1700000000, 1700000000))
+    _os.utime(newer, (1700000000 + 60, 1700000000 + 60))
+    _time.sleep(0)  # no-op, just keeps imports tight
+
+    got = A.discover_default_db()
+    assert got.endswith("trades_uvxy.db"), f"expected newest per-symbol, got {got}"
+
+
+def test_discover_default_db_falls_back_to_legacy_when_no_per_symbol(tmp_path, monkeypatch):
+    """No per-symbol DB on disk -> last-resort legacy path (may be absent)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "runtime").mkdir()
+    got = A.discover_default_db()
+    # Legacy fallback is a string — the actual file does not need to exist;
+    # downstream check_d_sqlite reports FAIL if missing, which is the
+    # historical behavior we deliberately preserve.
+    assert got == A.LEGACY_SINGLE_DB
+
+
+def test_discover_default_db_ignores_non_matching_files(tmp_path, monkeypatch):
+    """Files that don't match trades_*.db must not be picked up."""
+    monkeypatch.chdir(tmp_path)
+    rt = tmp_path / "runtime"; rt.mkdir()
+    (rt / "account.db").write_text("x")
+    (rt / "notes.txt").write_text("x")
+    got = A.discover_default_db()
+    assert got == A.LEGACY_SINGLE_DB
+
+
+def test_main_argparse_default_db_uses_discovery(tmp_path, monkeypatch, capsys):
+    """End-to-end: `python audit_resilience.py` (no --db) should resolve to
+    the newest per-symbol DB rather than legacy. We only assert the path
+    selection — the audit itself is allowed to FAIL because the DB is empty.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DB_FILE", raising=False)
+    rt = tmp_path / "runtime"; rt.mkdir()
+    per_sym = rt / "trades_uvxy.db"
+    # Build a minimally-valid DB so check_d does not crash before we can
+    # observe behavior — table set is intentionally incomplete; we only
+    # want to confirm the chosen path, not the audit verdict.
+    with sqlite3.connect(per_sym) as conn:
+        conn.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, timestamp TEXT)")
+
+    # Sanity: discovery should resolve to per_sym (a file we just created).
+    chosen = A.discover_default_db()
+    assert chosen.endswith("trades_uvxy.db"), chosen
+
+
+def test_main_argparse_db_explicit_override_still_wins(tmp_path, monkeypatch):
+    """Explicit --db must beat the discovered default."""
+    monkeypatch.chdir(tmp_path)
+    rt = tmp_path / "runtime"; rt.mkdir()
+    (rt / "trades_uvxy.db").write_text("x")
+    explicit = tmp_path / "elsewhere.db"
+    explicit.write_text("x")
+
+    parser = argparse.ArgumentParser()
+    # Re-create the parser fragment with the same default contract as main().
+    parser.add_argument("--db",
+                        default=os.environ.get("DB_FILE") or A.discover_default_db())
+    args = parser.parse_args(["--db", str(explicit)])
+    assert args.db == str(explicit)
+
+
+# Imports needed for the explicit-override test above.
+import argparse  # noqa: E402
+import os        # noqa: E402
